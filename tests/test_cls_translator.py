@@ -1,44 +1,43 @@
 import os
 
+from dbx_fabric_security.extractor.grants import parse_grants_csv
 from dbx_fabric_security.extractor.view_parser import parse_views_file
 from dbx_fabric_security.translator.cls_translator import translate_cls
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sample_views.sql")
+GRANTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "grants_sample.csv")
+
+
+def _views():
+    grants = parse_grants_csv(GRANTS_FIXTURE)
+    return parse_views_file(FIXTURE, grants_by_view=grants)
 
 
 def test_derived_column_never_gets_direct_entitlement():
-    views = parse_views_file(FIXTURE)
-    view = [v for v in views if v.fq_name == "sec.finance.v_derived_example"][0]
-    entitlements = translate_cls([view])
+    views = [v for v in _views() if v.fq_name == "sec.finance.v_derived_example"]
+    entitlements = translate_cls(views)
 
-    columns_with_entitlements = {e.column for e in entitlements}
-    assert "c" not in columns_with_entitlements
-
-    derived_source_entries = [e for e in entitlements if e.source_type == "DERIVED_SOURCE"]
-    assert {e.column for e in derived_source_entries} == {"a", "b"}
-    assert all(e.derived_output_column == "c" for e in derived_source_entries)
-    assert all(e.ad_group is None for e in derived_source_entries)
+    columns = {e.column for e in entitlements}
+    assert columns == {"a", "b"}
+    assert "c" not in columns
+    assert all(e.principal == "finance_readers" for e in entitlements)
+    assert all(e.table == "sec.finance.table1" for e in entitlements)
 
 
-def test_masked_columns_produce_permit_entitlements():
-    views = parse_views_file(FIXTURE)
-    view = [v for v in views if v.fq_name == "sec.hr.v_employee_cls"][0]
-    entitlements = translate_cls([view])
+def test_every_grantee_gets_every_flattened_column():
+    views = [v for v in _views() if v.fq_name == "sec.sales.v_orders_by_region"]
+    entitlements = translate_cls(views)
 
-    permits = {(e.column, e.ad_group) for e in entitlements if e.access_effect == "PERMIT"}
-    assert ("salary", "finance_readers") in permits
-    assert ("ssn", "hr_full_access") in permits
+    by_principal: dict[str, set[str]] = {}
+    for e in entitlements:
+        by_principal.setdefault(e.principal, set()).add(e.column)
 
-    salary_entry = [e for e in entitlements if e.column == "salary"][0]
-    assert salary_entry.mask_else_value == "NULL"
-    assert salary_entry.table == "sec.hr.employee"
+    assert by_principal["sales_region_us"] == {"order_id", "customer", "region", "amount"}
+    assert by_principal["sales_region_eu"] == {"order_id", "customer", "region", "amount"}
 
 
-def test_plain_columns_are_default_visible():
-    views = parse_views_file(FIXTURE)
-    view = [v for v in views if v.fq_name == "sec.hr.v_employee_cls"][0]
-    entitlements = translate_cls([view])
-
-    emp_id_entry = [e for e in entitlements if e.column == "emp_id"][0]
-    assert emp_id_entry.access_effect == "DEFAULT_VISIBLE"
-    assert emp_id_entry.source_type == "DIRECT"
+def test_view_with_no_grantees_produces_no_entitlements():
+    views = _views()
+    for v in views:
+        v.grantees = []
+    assert translate_cls(views) == []

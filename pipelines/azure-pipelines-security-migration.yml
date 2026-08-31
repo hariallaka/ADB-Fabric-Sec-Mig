@@ -21,6 +21,10 @@
 #                                Fabric API permissions; store as a secret variable)
 #   DATABRICKS_VIEWS_PATH     - only used when extractSource=localFile: path (in
 #                                this repo or an artifact drop) to exported view DDL
+#   DATABRICKS_GRANTS_PATH    - only used when extractSource=localFile: path to a
+#                                grants CSV (view,principal,privilege) -- who holds
+#                                SELECT on each view; this is the sole source of
+#                                CLS/RLS access, never inferred from view SQL
 #   AGS_EXPORT_PATH           - path to the latest AGS group export CSV
 #   FABRIC_DEPLOY_TARGETS     - path to the table -> {workspaceId, itemId} map
 #
@@ -72,20 +76,25 @@ stages:
                   mkdir -p "$(outDir)"
                   cp "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_views.sql" \
                      "$(outDir)/extracted_views.sql"
+                  cp "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_grants.csv" \
+                     "$(outDir)/extracted_grants.csv"
                   echo "##vso[task.setvariable variable=viewsPath;isOutput=true]$(outDir)/extracted_views.sql"
+                  echo "##vso[task.setvariable variable=grantsPath;isOutput=true]$(outDir)/extracted_grants.csv"
                 name: setViewsPath
                 displayName: "Use extraction artifact from Databricks pipeline"
           - ${{ if eq(parameters.extractSource, 'localFile') }}:
               - script: |
                   echo "##vso[task.setvariable variable=viewsPath;isOutput=true]$(DATABRICKS_VIEWS_PATH)"
+                  echo "##vso[task.setvariable variable=grantsPath;isOutput=true]$(DATABRICKS_GRANTS_PATH)"
                 name: setViewsPath
-                displayName: "Use local view SQL file (dev/test)"
+                displayName: "Use local view SQL + grants CSV (dev/test)"
 
   - stage: Translate
     displayName: "Translate CLS/RLS into Fabric roles"
     dependsOn: ResolveViewsInput
     variables:
       viewsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.viewsPath'] ]
+      grantsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.grantsPath'] ]
     jobs:
       - job: TranslateJob
         steps:
@@ -98,12 +107,14 @@ stages:
           - script: |
               python -m dbx_fabric_security.cli translate \
                 --views "$(viewsPath)" \
+                --grants "$(grantsPath)" \
                 --ags-export "$(AGS_EXPORT_PATH)" \
                 --out-dir "$(outDir)"
             displayName: "Run translation"
           - script: |
               python -m dbx_fabric_security.cli map-roles \
                 --views "$(viewsPath)" \
+                --grants "$(grantsPath)" \
                 --ags-export "$(AGS_EXPORT_PATH)" \
                 --out-dir "$(outDir)"
             displayName: "Build AGS -> AD Group -> Fabric Role mapping"
@@ -133,9 +144,9 @@ stages:
               import json, sys
               path = "$(Pipeline.Workspace)/translated-security-model/fabric_data_access_roles.json"
               roles = json.load(open(path))
-              unresolved = [r["name"] for r in roles if r.get("unresolvedAdGroupObjectId")]
+              unresolved = [r["name"] for r in roles if r.get("unresolvedPrincipalObjectId")]
               if unresolved:
-                  print(f"::warning::{len(unresolved)} role(s) reference an AD group missing from "
+                  print(f"::warning::{len(unresolved)} role(s) reference a principal missing from "
                         f"the AGS export and cannot be deployed as-is: {unresolved}")
               print(f"Validated {len(roles)} Fabric role definition(s).")
               PY
@@ -160,6 +171,7 @@ stages:
       - ResolveViewsInput
     variables:
       viewsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.viewsPath'] ]
+      grantsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.grantsPath'] ]
     jobs:
       - job: DeployJob
         steps:
@@ -172,6 +184,7 @@ stages:
           - script: |
               python -m dbx_fabric_security.cli deploy \
                 --views "$(viewsPath)" \
+                --grants "$(grantsPath)" \
                 --ags-export "$(AGS_EXPORT_PATH)" \
                 --targets "$(FABRIC_DEPLOY_TARGETS)" \
                 --bearer-token "$(FABRIC_API_TOKEN)" \

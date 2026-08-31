@@ -130,3 +130,38 @@ class DatabricksApiClient:
             fq_name = f"{cat}.{sch}.{name}"
             ddl_by_view[fq_name] = f"CREATE OR REPLACE VIEW {fq_name} AS\n{view_definition}"
         return ddl_by_view
+
+    def fetch_view_grants(
+        self, warehouse_id: str, catalog: str, schema: str | None = None
+    ) -> dict[str, list[str]]:
+        """Returns ``{fully_qualified_view_name: [principal, ...]}`` for every
+        principal (AD group or user) holding ``SELECT`` on a view in the
+        given catalog. This is the source of truth for who gets CLS/RLS
+        access -- it is never inferred from the view's SQL text.
+
+        Joins ``information_schema.table_privileges`` to
+        ``information_schema.views`` so only view grants are returned (a
+        SELECT grant on a physical table is out of this toolkit's scope).
+        """
+        where = f"v.table_schema = '{schema}'" if schema else "1=1"
+        statement = (
+            "SELECT v.table_catalog, v.table_schema, v.table_name, p.grantee "
+            f"FROM {catalog}.information_schema.table_privileges p "
+            f"JOIN {catalog}.information_schema.views v "
+            "  ON p.table_catalog = v.table_catalog "
+            "  AND p.table_schema = v.table_schema "
+            "  AND p.table_name = v.table_name "
+            f"WHERE p.privilege_type = 'SELECT' AND {where}"
+        )
+        result = self.execute_statement(warehouse_id, statement)
+        if result.dry_run:
+            return {}
+
+        rows = result.response_body.get("result", {}).get("data_array", [])
+        grants_by_view: dict[str, list[str]] = {}
+        for cat, sch, name, grantee in rows:
+            fq_name = f"{cat}.{sch}.{name}"
+            grants_by_view.setdefault(fq_name, [])
+            if grantee not in grants_by_view[fq_name]:
+                grants_by_view[fq_name].append(grantee)
+        return grants_by_view

@@ -1,5 +1,5 @@
 """Merges CLS + RLS entitlements into deployable Fabric OneLake "Data Access
-Role" payloads, one role per (table, AD group) pair.
+Role" payloads, one role per (table, principal) pair.
 
 The payload shape approximates the Fabric REST API's Item Data Access Roles
 resource (``PUT /v1/workspaces/{workspaceId}/items/{itemId}/dataAccessRoles``).
@@ -24,52 +24,43 @@ def _slug(value: str) -> str:
 def build_fabric_roles(
     cls_entitlements: list[ClsEntitlement],
     rls_entitlements: list[RlsEntitlement],
-    group_directory: dict[str, str] | None = None,
+    principal_directory: dict[str, str] | None = None,
 ) -> list[dict]:
     """Returns a list of Fabric data-access-role payloads keyed by
-    ``(table, ad_group)``. Rows with no AD group (DEFAULT_VISIBLE / plain
-    attribute filters) are excluded from role payloads but remain visible
-    in the flat CLS/RLS reports for governance review.
+    ``(table, principal)``. ``principal_directory`` maps a principal name
+    (AD group or user) to its Entra object id, typically from an AGS export.
     """
 
-    group_directory = group_directory or {}
+    principal_directory = principal_directory or {}
     keys: set[tuple[str, str]] = set()
 
     for e in cls_entitlements:
-        if e.table and e.ad_group:
-            keys.add((e.table, e.ad_group))
+        if e.table:
+            keys.add((e.table, e.principal))
     for r in rls_entitlements:
-        if r.table and r.ad_group:
-            keys.add((r.table, r.ad_group))
+        if r.table:
+            keys.add((r.table, r.principal))
 
     roles = []
-    for table, group in sorted(keys):
+    for table, principal in sorted(keys):
         permit_columns = sorted(
-            {
-                e.column
-                for e in cls_entitlements
-                if e.table == table and e.ad_group == group and e.access_effect == "PERMIT"
-            }
+            {e.column for e in cls_entitlements if e.table == table and e.principal == principal}
         )
         row_filters = sorted(
-            {
-                r.row_filter_predicate
-                for r in rls_entitlements
-                if r.table == table and r.ad_group == group
-            }
+            {r.row_filter_predicate for r in rls_entitlements if r.table == table and r.principal == principal}
         )
-        object_id = group_directory.get(group)
+        object_id = principal_directory.get(principal)
 
         roles.append(
             {
-                "name": f"role_{_slug(table)}_{_slug(group)}",
+                "name": f"role_{_slug(table)}_{_slug(principal)}",
                 "table": table,
                 "members": {
                     "microsoftEntraMembers": [
                         {
-                            "objectId": object_id or "<UNRESOLVED_AD_GROUP_OBJECT_ID>",
+                            "objectId": object_id or "<UNRESOLVED_PRINCIPAL_OBJECT_ID>",
                             "objectType": "Group",
-                            "groupName": group,
+                            "principalName": principal,
                         }
                     ]
                 },
@@ -84,19 +75,9 @@ def build_fabric_roles(
                         ],
                     }
                 ],
-                "columnRules": {
-                    "permit": permit_columns,
-                    "note": (
-                        "Columns not listed here follow the table's default "
-                        "visibility; only columns carrying an explicit "
-                        "dynamic-view mask are enumerated."
-                        if permit_columns
-                        else "No column-level mask found for this group/table; "
-                        "table-level access applies to all columns."
-                    ),
-                },
+                "columnRules": {"permit": permit_columns},
                 "rowFilters": row_filters or ["TRUE"],
-                "unresolvedAdGroupObjectId": object_id is None,
+                "unresolvedPrincipalObjectId": object_id is None,
             }
         )
 

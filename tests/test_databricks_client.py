@@ -14,6 +14,32 @@ def test_fetch_view_ddl_dry_run_returns_empty_mapping():
     assert ddl == {}
 
 
+def test_fetch_view_grants_dry_run_returns_empty_mapping():
+    client = DatabricksApiClient(workspace_url="https://example.azuredatabricks.net", dry_run=True)
+    grants = client.fetch_view_grants("wh-1", catalog="sec", schema="hr")
+    assert grants == {}
+
+
+def test_grants_reconstruction_shape():
+    client = DatabricksApiClient(workspace_url="https://example.azuredatabricks.net", dry_run=True)
+
+    class _FakeResult:
+        dry_run = False
+        response_body = {
+            "result": {
+                "data_array": [
+                    ["sec", "hr", "v_employee_basic", "hr_readers"],
+                    ["sec", "hr", "v_employee_basic", "hr_admin"],
+                ]
+            }
+        }
+
+    client.execute_statement = lambda warehouse_id, statement: _FakeResult()  # noqa: E731
+    grants = client.fetch_view_grants("wh-1", catalog="sec", schema="hr")
+
+    assert grants == {"sec.hr.v_employee_basic": ["hr_readers", "hr_admin"]}
+
+
 def test_missing_token_raises_on_live_call():
     client = DatabricksApiClient(workspace_url="https://example.azuredatabricks.net", dry_run=False)
     try:

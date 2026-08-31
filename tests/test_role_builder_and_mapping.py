@@ -1,5 +1,6 @@
 import os
 
+from dbx_fabric_security.extractor.grants import parse_grants_csv
 from dbx_fabric_security.extractor.view_parser import parse_views_file
 from dbx_fabric_security.mapping.role_mapper import (
     build_role_mapping,
@@ -11,36 +12,45 @@ from dbx_fabric_security.translator.rls_translator import translate_rls
 from dbx_fabric_security.translator.role_builder import build_fabric_roles
 
 VIEWS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sample_views.sql")
+GRANTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "grants_sample.csv")
 AGS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "ags_export_sample.csv")
 
 
 def _translate_all():
-    views = parse_views_file(VIEWS_FIXTURE)
+    grants = parse_grants_csv(GRANTS_FIXTURE)
+    views = parse_views_file(VIEWS_FIXTURE, grants_by_view=grants)
     return translate_cls(views), translate_rls(views), views
 
 
-def test_role_builder_merges_cls_and_rls_per_table_and_group():
+def test_role_builder_merges_cls_and_rls_per_table_and_principal():
     cls_e, rls_e, _ = _translate_all()
     ags = load_ags_export(AGS_FIXTURE)
     roles = build_fabric_roles(cls_e, rls_e, group_directory(ags))
 
-    hr_finance_role = [
-        r for r in roles if r["table"] == "sec.hr.employee" and "finance_readers" in r["name"]
+    finance_role = [
+        r for r in roles if r["table"] == "sec.finance.table1" and "finance_readers" in r["name"]
     ]
-    assert len(hr_finance_role) == 1
-    role = hr_finance_role[0]
-    assert "salary" in role["columnRules"]["permit"]
+    assert len(finance_role) == 1
+    role = finance_role[0]
+    assert role["columnRules"]["permit"] == ["a", "b"]
+    assert role["rowFilters"] == ["TRUE"]
     assert role["members"]["microsoftEntraMembers"][0]["objectId"] == ags["finance_readers"].ad_group_object_id
-    assert role["unresolvedAdGroupObjectId"] is False
+    assert role["unresolvedPrincipalObjectId"] is False
 
 
-def test_role_builder_flags_unresolved_group():
+def test_or_predicate_role_carries_full_predicate():
     cls_e, rls_e, _ = _translate_all()
-    # Deliberately incomplete directory -> object id should be marked unresolved.
-    roles = build_fabric_roles(cls_e, rls_e, group_directory={})
-    assert all(r["unresolvedAdGroupObjectId"] for r in roles)
+    roles = build_fabric_roles(cls_e, rls_e, {})
+    role = [r for r in roles if r["table"] == "sec.sales.orders" and "sales_region_us" in r["name"]][0]
+    assert role["rowFilters"] == ["region = 'US' OR region = 'CA'"]
+
+
+def test_role_builder_flags_unresolved_principal():
+    cls_e, rls_e, _ = _translate_all()
+    roles = build_fabric_roles(cls_e, rls_e, principal_directory={})
+    assert all(r["unresolvedPrincipalObjectId"] for r in roles)
     assert all(
-        r["members"]["microsoftEntraMembers"][0]["objectId"] == "<UNRESOLVED_AD_GROUP_OBJECT_ID>"
+        r["members"]["microsoftEntraMembers"][0]["objectId"] == "<UNRESOLVED_PRINCIPAL_OBJECT_ID>"
         for r in roles
     )
 
@@ -51,7 +61,14 @@ def test_role_mapping_ties_ags_to_fabric_role():
     roles = build_fabric_roles(cls_e, rls_e, group_directory(ags))
     mapping = build_role_mapping(roles, ags)
 
-    finance_row = [m for m in mapping if m["adGroupName"] == "finance_readers"][0]
-    assert finance_row["agsId"] == "AGS-1001"
-    assert finance_row["identitySourceOfTruth"] == "AGS"
-    assert finance_row["unresolvedAdGroup"] is False
+    # finance_readers has SELECT on two views over two different tables
+    # (v_derived_example -> table1, v_my_expense_reports -> expense_reports),
+    # so it legitimately gets one Fabric role per table.
+    finance_rows = [m for m in mapping if m["adGroupName"] == "finance_readers"]
+    assert {r["oneLakeObject"] for r in finance_rows} == {
+        "sec.finance.table1",
+        "sec.finance.expense_reports",
+    }
+    assert all(r["agsId"] == "AGS-1001" for r in finance_rows)
+    assert all(r["identitySourceOfTruth"] == "AGS" for r in finance_rows)
+    assert all(r["unresolvedAdGroup"] is False for r in finance_rows)

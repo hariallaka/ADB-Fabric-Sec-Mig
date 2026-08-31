@@ -2,44 +2,49 @@
 
 ## Recommendation: **Conditional Go**
 
-Automated translation of Databricks Unity Catalog view-based CLS/RLS into
+Automated translation of Databricks Unity Catalog view-based access into
 Microsoft Fabric OneLake security roles is **technically viable** and was
-demonstrated end-to-end in this spike's proof of concept: extraction,
-translation (including the derived-column assumption), AGS-to-Fabric-role
-mapping, and a dry-run automated deployment all work against representative
-view patterns, with 19/19 automated tests passing (see
-[poc-findings.md](./poc-findings.md)).
+demonstrated end-to-end in this spike's proof of concept: extraction (both
+Unity Catalog SELECT grants and view shape), translation (including the
+derived-column assumption and verbatim WHERE-clause reproduction, including
+OR-joined predicates), AGS-to-Fabric-role mapping, and a dry-run automated
+deployment all work against representative view patterns, with 28/28
+automated tests passing (see [poc-findings.md](./poc-findings.md)).
+
+The model settled on is deliberately simple: a view's grantees come from
+Unity Catalog's actual `SELECT` grants (queried directly, never inferred
+from SQL), and the view's SQL is used only to work out what data that grant
+covers — the flattened source columns for CLS, and the WHERE clause
+verbatim for RLS. That simplicity is itself a feasibility point in favor of
+Go: there is very little translation logic that can be subtly wrong,
+because there is very little translation logic, period.
 
 Proceeding to a production build is recommended **conditional on** closing
 three gaps before implementation scope is finalized:
 
-1. **Confirm which Databricks security pattern the target estate actually
-   uses.** This toolkit's extraction covers *view-embedded* CLS/RLS (the
-   `CASE WHEN is_account_group_member(...) ...` pattern named in the
-   ticket). It does **not** read native Unity Catalog row filters/column
-   masks (`ALTER TABLE ... SET ROW FILTER/MASK`), which is the more common
-   pattern in estates onboarded after UC's native RLS/CLS went GA. This is
-   the single largest scope risk of the three — it determines whether a
-   second extraction path needs to be built before this approach covers the
-   real environment at all. **Run `SHOW ROW FILTERS`/`SHOW COLUMN MASKS`
-   against a representative sample of production catalogs before
+1. **Confirm the target estate doesn't rely on native Unity Catalog row
+   filters/column masks** (`ALTER TABLE ... SET ROW FILTER/MASK`). This
+   toolkit's security model is entirely view-based (a view's SELECT grant
+   plus its SQL shape); it does not read native row filters/masks attached
+   directly to tables, which live in a different system table entirely and
+   are invisible to this toolkit. **Run `SHOW ROW FILTERS`/`SHOW COLUMN
+   MASKS` against a representative sample of production catalogs before
    finalizing implementation scope** (see
    [limitations.md](./limitations.md#native-unity-catalog-row-filters--column-masks-not-covered)).
 2. **Validate the Fabric Item Data Access Roles API schema against a live
    tenant.** This spike's role payloads (`role_builder.py`) are a
    best-effort mapping to a preview API whose exact field names/grammar
    were not confirmed against a live call in this spike (no Fabric tenant
-   credentials were in scope). This is a short (hours, not days)
-   validation task, isolated to one module — it does not put the rest of
-   the design at risk, but it must happen before any code here is pointed
-   at production.
+   credentials were in scope). This also covers confirming that Fabric's
+   row-filter expression grammar accepts the Databricks-SQL predicates this
+   toolkit reproduces verbatim. Short (hours, not days), isolated to one
+   module.
 3. **Decide the production posture on nested and complex views** (see
    [limitations.md](./limitations.md)). These are *detected*, not silently
    mis-translated, but a decision is needed on whether to (a) build the
-   nested-view composition pass, (b) require source views to be
-   flattened/simplified before onboarding to this pipeline, or (c) route
-   flagged views to a permanent manual-translation track. This is a scope
-   and process decision, not a technical blocker.
+   nested-view grant/filter composition pass, (b) require source views to
+   be flattened/simplified before onboarding to this pipeline, or (c) route
+   flagged views to a permanent manual-translation track.
 
 Neither gap invalidates the architecture or the translation logic
 demonstrated; both are naturally scoped next steps rather than reasons to
@@ -49,37 +54,47 @@ stop.
 
 - **Required Fabric APIs identified.** The Item Data Access Roles API is
   the correct provisioning target and matches the ticket's own
-  `OneLake Security Role` language; no missing capability was found that
-  would block the approach outright.
+  `OneLake Security Role` language.
 - **AGS remains authoritative.** The design never writes to AGS or AD
   groups; it only reads exports, satisfying a hard constraint from the
   ticket's scope and success criteria.
+- **Access is read from the real source of truth.** Grants come from Unity
+  Catalog's own `SELECT` privilege data, not guessed from SQL patterns —
+  removing an entire category of "did we parse the identity check
+  correctly" risk that an earlier iteration of this design carried.
 - **The one named design risk (derived columns) is solved and tested.**
   The exact example from the ticket (`a * b AS c`) was implemented and
   passes as a unit test, not just a documented intention.
+- **The OR-clause requirement is met by construction, not by a special
+  case.** WHERE clauses are never decomposed — they're captured and
+  reproduced verbatim — so `OR`, `AND`, and arbitrary nesting all work
+  without dedicated handling to get wrong. Tested directly, including a
+  nested `(A AND B) OR C` case.
 - **Automation is real, not aspirational.** A working CLI
-  (`extract | translate | map-roles | deploy`) and an Azure DevOps pipeline
-  with a manual approval gate before any live Fabric call were both built
-  and exercised in this spike, not just designed on paper.
-- **Failure modes degrade safely.** Unrecognized SQL constructs are flagged
-  for manual review rather than silently mis-translated; unresolved AD
-  groups block deployment rather than deploying with a missing member;
-  deploys default to dry-run and never touch a manually-authored Fabric
-  role.
+  (`extract | extract-databricks | translate | map-roles | deploy`) and two
+  Azure DevOps pipelines (Databricks-side extraction, Fabric-side
+  translate/deploy, chained via a pipeline artifact) with a manual approval
+  gate before any live Fabric call were both built and exercised in this
+  spike, not just designed on paper.
+- **Failure modes degrade safely.** Unrecognized SQL constructs (joins,
+  nested views, `SELECT *`) are flagged for manual review rather than
+  silently mis-translated; a grantee missing from the AGS export blocks
+  deployment rather than deploying with a missing member; deploys default
+  to dry-run and never touch a manually-authored Fabric role.
 
 ## Why not an unconditional Go
 
 - **This is the biggest open question, ahead of the API risk below:**
-  extraction was proven against the view-embedded CLS/RLS pattern the
-  ticket named, but not validated against a real catalog to confirm that
-  pattern (rather than native UC row filters/column masks) is what's
-  actually deployed. If the real estate leans native, extraction coverage
-  today is closer to zero than to "done" for those tables, regardless of
-  how well translation and role-building work downstream.
+  extraction was proven against Unity Catalog's view-grant model, but not
+  validated against a real catalog to confirm the target estate doesn't
+  also lean on native row filters/column masks, which this toolkit cannot
+  see at all. If it does, coverage for those tables is zero regardless of
+  how well the view-based translation works.
 - The Fabric API this design depends on most heavily (Data Access Roles)
   was in public preview and unvalidated against a live tenant in this
-  spike — a schema change there is the single largest source of rework
-  risk on the Fabric side, and it hasn't been retired yet.
+  spike — a schema change there, or a row-filter grammar that rejects some
+  Databricks-SQL construct this toolkit reproduces verbatim, is the largest
+  source of rework risk on the Fabric side.
 - Nested and complex views are real limitations, not edge cases likely to
   be rare in a mature Unity Catalog estate; the production scope estimate
   should assume a non-trivial fraction of views will need one of the three
@@ -93,9 +108,11 @@ stop.
    determines whether a second extraction path is required before scope is
    finalized.
 2. Run the Fabric API validation pass described in §2 against a
-   non-production Fabric workspace.
+   non-production Fabric workspace, including a spot-check that its
+   row-filter grammar accepts a representative sample of real WHERE
+   clauses from the target estate.
 3. Inventory a representative sample of real production Databricks views
-   (not just the 8 synthetic fixtures used here) and re-run this toolkit's
+   (not just the 7 synthetic fixtures used here) and re-run this toolkit's
    `extract` / `extract-databricks` command against them to get a
    real-world unsupported-construct rate — this sizes the nested/complex-view
    decision in §3 with data instead of a guess.

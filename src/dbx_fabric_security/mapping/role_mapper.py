@@ -57,13 +57,13 @@ def build_role_mapping(
 
     mapping_rows = []
     for role in fabric_roles:
-        group_name = role["members"]["microsoftEntraMembers"][0]["groupName"]
-        ags = ags_records.get(group_name)
+        principal_name = role["members"]["microsoftEntraMembers"][0]["principalName"]
+        ags = ags_records.get(principal_name)
         mapping_rows.append(
             {
                 "agsId": ags.ags_id if ags else None,
                 "agsName": ags.ags_name if ags else None,
-                "adGroupName": group_name,
+                "adGroupName": principal_name,
                 "adGroupObjectId": ags.ad_group_object_id if ags else None,
                 "fabricRoleName": role["name"],
                 "oneLakeObject": role["table"],

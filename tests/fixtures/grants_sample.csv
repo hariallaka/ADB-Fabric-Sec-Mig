@@ -1,0 +1,9 @@
+view,principal,privilege
+sec.finance.v_derived_example,finance_readers,SELECT
+sec.hr.v_employee_basic,hr_readers,SELECT
+sec.sales.v_orders_by_region,sales_region_us,SELECT
+sec.sales.v_orders_by_region,sales_region_eu,SELECT
+sec.sales.v_orders_secure,sales_finance,SELECT
+sec.hr.v_employee_export,export_team,SELECT
+sec.sales.v_regional_totals,sales_admin,SELECT
+sec.finance.v_my_expense_reports,finance_readers,SELECT
