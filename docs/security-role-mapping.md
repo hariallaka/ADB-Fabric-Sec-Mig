@@ -24,11 +24,15 @@ Unity Catalog SELECT grant  →  AD Group / principal (Entra object id)  →  On
   `role_<table_slug>_<principal_slug>` so deploys can identify and manage
   only the roles they own (see `fabric_api/deploy.py`). Carries the merged
   column list and row filter for that principal/table combination.
-- **OneLake Shortcut / UCM Data Object** — the Fabric Lakehouse table (or
-  shortcut) the role's `decisionRules` path scopes to. The mapping from a
-  Databricks-qualified table name (`catalog.schema.table`) to a Fabric
-  `(workspaceId, itemId)` is supplied out of band via a target map (see
-  `tests/fixtures/deploy_targets_sample.json`).
+- **OneLake Shortcut / UCM Data Object** — the Fabric Lakehouse **table**
+  the role's `decisionRules` path scopes to. Never a view: views are
+  extraction-only inputs, used solely to work out what CLS/RLS a table's
+  grantees should get (see `docs/technical-assessment.md` §1) — the
+  deployable unit is always the physical base table underneath. The mapping
+  from a Databricks-qualified table name (`catalog.schema.table`) to a
+  Fabric `(workspaceId, itemId)` is supplied out of band via a target map
+  (see `tests/fixtures/deploy_targets_sample.json` and "Relationship
+  between Fabric roles and OneLake objects" below).
 
 ## Group membership management
 
@@ -60,6 +64,21 @@ clause. If a view joins multiple base tables, extraction still runs and
 flags the view `is_complex`, but per-table role generation from a
 multi-table view is not attempted automatically — see
 [limitations.md](./limitations.md).
+
+`Tables/<table>` uses only the *bare* table name (the last segment of the
+Databricks-qualified `catalog.schema.table`), so this resolves correctly
+against a Fabric Lakehouse table with no per-table configuration **as long
+as the table is named identically in Fabric and Databricks** — a common
+migration choice, and the one this design assumes. What still needs
+configuring per deployment is which Fabric workspace/Lakehouse *item* a
+table lives in, via `--targets`. Because names match, that map can be
+specified once **per Databricks schema** rather than once per table — see
+"Target resolution: tables, not views" in the main README for the full
+`schemas`/`tables` shape, and
+`fabric_api/deploy.resolve_table_target` for the implementation. A nested
+view's base-view name (not a real table) is explicitly excluded from
+target resolution regardless of whether a schema default would otherwise
+match it — see the same README section.
 
 ## Example mapping row
 

@@ -36,7 +36,7 @@ from dbx_fabric_security.extractor.databricks_client import DatabricksApiClient
 from dbx_fabric_security.extractor.grants import parse_grants_csv
 from dbx_fabric_security.extractor.view_parser import parse_views_file
 from dbx_fabric_security.fabric_api.client import FabricApiClient
-from dbx_fabric_security.fabric_api.deploy import deploy_roles
+from dbx_fabric_security.fabric_api.deploy import deploy_roles, resolve_table_target
 from dbx_fabric_security.mapping.role_mapper import build_role_mapping
 from dbx_fabric_security.translator.cls_translator import translate_cls
 from dbx_fabric_security.translator.rls_translator import translate_rls
@@ -214,11 +214,20 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, principal_dir)
 
     with open(args.targets, encoding="utf-8") as fh:
-        raw_targets = json.load(fh)
-    table_targets = {t: (v["workspaceId"], v["itemId"]) for t, v in raw_targets.items()}
+        targets_config = json.load(fh)
+
+    # A role's "table" can be a nested view's *base view* name (e.g. a view
+    # built on another view), not a physical table -- that has no Fabric
+    # counterpart under table-only migration and must never be deployed,
+    # even if a schema-level target default would otherwise happen to match
+    # it. Filter these out before target resolution, not after, so a broad
+    # schema default can never accidentally scoop one up.
+    known_view_names = {v.fq_name for v in views}
+    deployable_roles = [r for r in fabric_roles if r["table"] not in known_view_names]
+    skipped_views = sorted({r["table"] for r in fabric_roles if r["table"] in known_view_names})
 
     client = FabricApiClient(bearer_token=args.bearer_token, dry_run=not args.apply)
-    results = deploy_roles(client, fabric_roles, table_targets)
+    results = deploy_roles(client, deployable_roles, targets_config)
 
     os.makedirs(args.out_dir, exist_ok=True)
     report = [
@@ -235,11 +244,17 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     ]
     _write_json(os.path.join(args.out_dir, "deployment_report.json"), report)
 
-    skipped = sorted(set(r["table"] for r in fabric_roles) - set(table_targets.keys()))
+    distinct_tables = sorted({r["table"] for r in deployable_roles})
+    skipped_unmapped = [t for t in distinct_tables if resolve_table_target(t, targets_config) is None]
+
     mode = "APPLIED" if args.apply else "DRY-RUN"
     print(f"Deployment ({mode}): {len(results)} item(s) targeted -> {args.out_dir}/deployment_report.json")
-    if skipped:
-        print(f"  Skipped (no target mapping configured): {skipped}")
+    if skipped_views:
+        print(f"  Skipped -- these are Databricks VIEWS (a nested view's base), not physical tables, "
+              f"so they have no Fabric counterpart under table-only migration: {skipped_views}")
+    if skipped_unmapped:
+        print(f"  Skipped -- no target configured (add under 'tables' or its schema under 'schemas' "
+              f"in --targets): {skipped_unmapped}")
 
 
 def cmd_run_all(args: argparse.Namespace) -> None:
@@ -305,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_deploy = sub.add_parser("deploy", help="Deploy translated roles to Fabric (dry-run by default)")
     common(p_deploy)
-    p_deploy.add_argument("--targets", required=True, help="JSON file mapping table -> {workspaceId, itemId}")
+    p_deploy.add_argument("--targets", required=True, help="JSON file with 'schemas' and/or 'tables' -> {workspaceId, itemId} (see fixtures/deploy_targets_sample.json)")
     p_deploy.add_argument("--bearer-token", default=os.environ.get("FABRIC_API_TOKEN"))
     p_deploy.add_argument("--apply", action="store_true", help="Actually call the Fabric API (default: dry-run)")
     p_deploy.set_defaults(func=cmd_deploy)

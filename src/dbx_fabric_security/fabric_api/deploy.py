@@ -1,6 +1,19 @@
 """Deployment orchestration: takes the translated Fabric role payloads plus
-a table -> (workspaceId, itemId) target map, and idempotently upserts them
-via ``FabricApiClient``.
+a target config, and idempotently upserts them via ``FabricApiClient``.
+
+Every role produced by ``role_builder.build_fabric_roles`` is scoped to a
+*physical base table* (``role["table"]``, a Databricks-qualified
+``catalog.schema.table`` name) -- never to a view. Views are extraction-only
+artifacts, used solely to work out what CLS/RLS a table's grantees should
+get; nothing here ever deploys a view. See README.md "Target resolution:
+tables, not views" for the full rationale.
+
+Target resolution (``resolve_table_target``) assumes the physical table's
+*name* is identical in Fabric OneLake as in Databricks (the last segment of
+the qualified name, already baked into each role's ``Tables/<name>`` path
+by ``role_builder``). That assumption is what lets one *schema*-level
+target entry cover every table under it, instead of listing every table by
+hand -- see the ``schemas`` key below.
 
 Idempotency strategy: this toolkit only owns roles whose name matches the
 ``role_<table>_<group>`` convention produced by
@@ -19,6 +32,39 @@ from dataclasses import dataclass, field
 from dbx_fabric_security.fabric_api.client import FabricApiClient, FabricApiResult
 
 _MANAGED_PREFIX = "role_"
+
+
+def resolve_table_target(table_fqn: str, targets_config: dict) -> tuple[str, str] | None:
+    """Resolves a Databricks-qualified table name to ``(workspace_id,
+    item_id)`` of the Fabric Lakehouse item that owns it.
+
+    ``targets_config`` has two optional keys:
+
+    - ``"tables"``: exact ``catalog.schema.table`` -> ``{"workspaceId": ..,
+      "itemId": ..}``, for a table that needs to land somewhere other than
+      its schema's default (or when schemas don't map 1:1 to Lakehouses).
+    - ``"schemas"``: ``catalog.schema`` -> ``{"workspaceId": .., "itemId":
+      ..}``, applied to every table under that schema that has no exact
+      entry in ``"tables"``. Relies on the table-name-parity assumption
+      above -- one entry then covers every table Databricks and Fabric
+      agree on the name of.
+
+    An exact table entry always wins over a schema default.
+    """
+    tables = targets_config.get("tables", {})
+    if table_fqn in tables:
+        entry = tables[table_fqn]
+        return entry["workspaceId"], entry["itemId"]
+
+    parts = table_fqn.split(".")
+    if len(parts) >= 2:
+        schema_fqn = ".".join(parts[:2])
+        schemas = targets_config.get("schemas", {})
+        if schema_fqn in schemas:
+            entry = schemas[schema_fqn]
+            return entry["workspaceId"], entry["itemId"]
+
+    return None
 
 
 @dataclass
@@ -68,12 +114,14 @@ def apply_deployment(client: FabricApiClient, plan: DeploymentPlan) -> FabricApi
 def deploy_roles(
     client: FabricApiClient,
     fabric_roles: list[dict],
-    table_targets: dict[str, tuple[str, str]],
+    targets_config: dict,
 ) -> list[tuple[DeploymentPlan, FabricApiResult]]:
-    """``table_targets`` maps a Databricks-qualified table name (as it
-    appears on each role's ``table`` field) to ``(workspace_id, item_id)``
-    of the Fabric Lakehouse item that should own the role. Tables with no
-    configured target are skipped and reported by the caller.
+    """``targets_config`` is resolved per table via ``resolve_table_target``
+    (see its docstring for the ``tables``/``schemas`` shape). Tables with no
+    configured target -- resolved via neither an exact entry nor their
+    schema's default -- are skipped; the caller is responsible for reporting
+    which ones and why (see ``cli.cmd_deploy``, which also distinguishes a
+    genuinely unmapped table from one that's actually a view).
     """
 
     by_table: dict[str, list[dict]] = {}
@@ -82,7 +130,7 @@ def deploy_roles(
 
     results = []
     for table, roles in by_table.items():
-        target = table_targets.get(table)
+        target = resolve_table_target(table, targets_config)
         if target is None:
             continue
         workspace_id, item_id = target

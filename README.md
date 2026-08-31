@@ -294,6 +294,63 @@ SELECT a * b AS c FROM table1;
 Verified by `tests/test_view_parser.py::test_derived_column_assumption` and
 `tests/test_cls_translator.py::test_derived_column_never_gets_direct_entitlement`.
 
+## Target resolution: tables, not views
+
+**This toolkit never deploys a view to Fabric.** Databricks views are
+extraction-only artifacts, read purely to work out what CLS/RLS a table's
+grantees should get (see "How access is determined" above); every Fabric
+role it builds is scoped to the *physical base table* the view sits on
+(`role["table"]`, e.g. `sec.hr.employee`), never to the view itself
+(`sec.hr.v_employee_active`). If you're migrating **tables**, not views, to
+Fabric — recreating each Databricks base table as a Fabric Lakehouse table
+and retiring the views — this is exactly the shape you want: the CLS/RLS
+logic a view expressed gets carried over and re-applied directly to its
+underlying table's Fabric counterpart.
+
+**If you keep the base table's name identical in Fabric and Databricks**
+(a common, recommended migration choice), you get a real simplification for
+free: `role_builder.py` already scopes each role's column rule to
+`Tables/<bare-table-name>` — just the last segment of the Databricks
+qualified name — so as long as that name matches the Fabric Lakehouse
+table's name, no per-table configuration is needed for *that* part. The one
+place a table still needs to be pointed at a Fabric workspace/Lakehouse
+*item* is `--targets` (deploy's target map), and that's where the naming
+decision pays off a second time: `--targets` accepts a **schema-level**
+default —
+
+```json
+{
+  "schemas": {
+    "sec.finance": {"workspaceId": "...", "itemId": "..."},
+    "sec.hr":      {"workspaceId": "...", "itemId": "..."},
+    "sec.sales":   {"workspaceId": "...", "itemId": "..."}
+  },
+  "tables": {
+    "sec.sales.order_lines": {"workspaceId": "...", "itemId": "..."}
+  }
+}
+```
+
+— so **one entry per Databricks schema** (mapping it to the Fabric
+Lakehouse item that hosts that schema's migrated tables) covers *every*
+table in it, instead of listing tables one by one. `"tables"` is for the
+exception: a specific table that needs to land in a different Lakehouse
+than its schema's default (an exact `"tables"` entry always wins over a
+`"schemas"` default for the same table). See
+`tests/fixtures/deploy_targets_sample.json` for a worked example, and
+`fabric_api/deploy.resolve_table_target` for the resolution logic.
+
+**Nested views are the one case this needs a human for.** A view built on
+*another view* (not a table) has a `base_tables` entry that's itself a view
+name (e.g. `sec.hr.v_employee_basic`) — under table-only migration, that
+name will never exist as a real Fabric table, so any role that would target
+it is filtered out before deployment and reported separately
+(`Skipped -- these are Databricks VIEWS...`), even if a schema-level
+default would otherwise have matched it by name. Resolve the nested view
+down to its ultimate physical table before deploying — see
+[`docs/limitations.md`](docs/limitations.md) for the general nested-view
+gap this falls under.
+
 ## Scope note
 
 This is a **spike**, not a production implementation. Production build-out,

@@ -12,7 +12,7 @@ python -m dbx_fabric_security.cli run-all \
 pytest tests/ -v
 ```
 
-## Test suite: 37/37 passing
+## Test suite: 43/43 passing
 
 ```
 tests/test_cls_translator.py::test_derived_column_never_gets_direct_entitlement PASSED
@@ -34,6 +34,12 @@ tests/test_databricks_client.py::test_missing_token_raises_on_live_call PASSED
 tests/test_databricks_client.py::test_ddl_reconstruction_shape PASSED
 tests/test_deploy.py::test_dry_run_never_calls_network_and_reports_plan PASSED
 tests/test_deploy.py::test_tables_without_target_mapping_are_skipped PASSED
+tests/test_deploy.py::test_schema_level_default_covers_every_table_in_it PASSED
+tests/test_deploy.py::test_exact_table_entry_overrides_schema_default PASSED
+tests/test_deploy.py::TestResolveTableTarget::test_exact_match_wins_over_schema PASSED
+tests/test_deploy.py::TestResolveTableTarget::test_falls_back_to_schema_default PASSED
+tests/test_deploy.py::TestResolveTableTarget::test_no_match_returns_none PASSED
+tests/test_deploy.py::TestResolveTableTarget::test_empty_config_returns_none PASSED
 tests/test_rls_translator.py::test_no_where_clause_yields_unrestricted_filter PASSED
 tests/test_rls_translator.py::test_and_predicate_carried_through_verbatim PASSED
 tests/test_rls_translator.py::test_or_predicate_carried_through_verbatim_for_every_grantee PASSED
@@ -53,7 +59,7 @@ tests/test_view_parser.py::test_nested_view_flagged PASSED
 tests/test_view_parser.py::test_complex_view_flagged_but_still_flattened PASSED
 tests/test_view_parser.py::test_reformatted_select_sql_matches_spike_example PASSED
 
-37 passed in 0.40s
+43 passed in 0.33s
 ```
 
 ## AC1 — CLS feasibility: evidence
@@ -192,20 +198,42 @@ sales_region_us,7c3a4e10-3333-...-000000000003,role_sec_sales_orders_sales_regio
 hr_contractor,,role_sec_hr_employee_hr_contractor,sec.hr.employee,3,["dept = 'Engineering' AND active = TRUE"]
 ```
 
-**Automated deployment feasibility:** `cli deploy` (dry-run by default)
-produced a deployment plan/report for 5 target Lakehouse items without any
-live network call:
+**Automated deployment feasibility, including schema-level target
+resolution:** `tests/fixtures/deploy_targets_sample.json` deliberately maps
+targets at the **schema** level (`sec.finance`, `sec.hr`, `sec.sales` each
+resolve to one Fabric Lakehouse item) plus one exact-table override
+(`sec.sales.order_lines`, routed to a different item than its schema
+default) — demonstrating the table-name-parity simplification: neither
+`sec.finance.table1` nor `sec.finance.expense_reports` is listed
+individually, yet both resolve correctly via the single `sec.finance` entry.
+`cli deploy` (dry-run by default) produced a deployment plan/report for 5
+target Lakehouse items without any live network call:
 
 ```
 Deployment (DRY-RUN): 5 item(s) targeted -> out/demo/deployment_report.json
-  Skipped (no target mapping configured): ['sec.hr.v_employee_basic']
+  Skipped -- these are Databricks VIEWS (a nested view's base), not physical
+  tables, so they have no Fabric counterpart under table-only migration:
+  ['sec.hr.v_employee_basic']
+```
+
+```
+sec.finance.expense_reports -> item 22222222...  (via "sec.finance" schema default)
+sec.finance.table1          -> item 22222222...  (via "sec.finance" schema default, same item)
+sec.hr.employee             -> item 33333333...  (via "sec.hr" schema default)
+sec.sales.order_lines       -> item 55555555...  (via exact "tables" override, NOT the sales schema default)
+sec.sales.orders            -> item 44444444...  (via "sec.sales" schema default)
 ```
 
 The one skipped table is `sec.hr.v_employee_basic`, a **view**, not a
 physical table — the nested view `v_employee_export` selects from it, so a
-role gets generated against that name, but it correctly has no deployment
-target configured since it isn't a Fabric Lakehouse table (consistent with
-the nested-view limitation documented separately).
+role gets generated against that name. Critically, `sec.hr.v_employee_basic`
+would otherwise *falsely match* the `sec.hr` schema default by name alone —
+it's excluded unconditionally, before target resolution runs, specifically
+so a schema-level default can never accidentally deploy a role against a
+Fabric table that doesn't exist. Enforced by
+`tests/test_deploy.py::test_schema_level_default_covers_every_table_in_it`,
+`test_exact_table_entry_overrides_schema_default`, and the
+`TestResolveTableTarget` cases.
 
 ## AC5 — Limitation coverage: evidence
 

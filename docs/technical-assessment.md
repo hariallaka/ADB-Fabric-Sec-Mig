@@ -151,6 +151,17 @@ full-replace `PUT` that first reads existing roles and preserves any role
 not owned by this toolkit's naming convention (`role_<table>_<principal>`),
 so manually-authored Fabric roles are never clobbered.
 
+Deployment targets a **physical table**, never a view, on the assumption
+that the table migration keeps the base table's name identical between
+Databricks and Fabric. `deploy`'s `--targets` config accordingly resolves
+per `catalog.schema.table`, with a schema-level default (`"schemas"`) that
+covers every table under it and an exact `"tables"` entry for the
+exceptions — see `fabric_api/deploy.resolve_table_target` and README
+"Target resolution: tables, not views". A role whose "table" is itself a
+known view name (a nested view's base) is excluded before resolution, so
+it can never be accidentally deployed under a schema default that happens
+to match its name.
+
 ## 6. Risks and Mitigations
 
 | Risk | Mitigation |
@@ -160,6 +171,7 @@ so manually-authored Fabric roles are never clobbered.
 | Extraction identity can't see the *complete* grantee list on a view (only `SELECT`, not ownership/`MANAGE`/admin) | `information_schema.table_privileges` silently omits grants the caller isn't entitled to see rather than erroring — mitigated by the one-time `grant-catalog-access` bootstrap step making the extraction identity a catalog owner (see README RBAC section). |
 | Nested/complex views produce an incomplete flattened column list or an incomplete row filter | Detected and flagged for manual review rather than translated with false confidence (see Limitations). |
 | Automated deploy overwrites a manually-created Fabric role | Deploy only manages roles matching its own naming convention and preserves everything else; full plan is diffed and reported before apply. |
+| A schema-level default target accidentally matches a nested view's base-view name (not a real table), deploying a role against a Fabric table that doesn't exist | Roles whose `table` is a known view name are filtered out before target resolution runs, unconditionally -- a schema default can never catch them by accident. Reported separately from genuinely unmapped tables (`cli.cmd_deploy`). |
 | A view's WHERE clause references a column not exposed in the SELECT list | The WHERE clause is reproduced verbatim regardless — Fabric's row filter, like the original Databricks view, can filter on a column it doesn't return. No special handling needed. |
 
 ## 7. Known Limitations

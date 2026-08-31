@@ -27,7 +27,13 @@
 #                                their Azure AD object id; this is the sole source
 #                                of CLS/RLS access, never inferred from view SQL
 #                                or from any AD-Group-Sync (AGS) export
-#   FABRIC_DEPLOY_TARGETS     - path to the table -> {workspaceId, itemId} map
+#   FABRIC_DEPLOY_TARGETS     - path to a JSON file with "schemas" and/or "tables"
+#                                keys mapping a Databricks catalog.schema (or an
+#                                exact catalog.schema.table override) to the Fabric
+#                                {workspaceId, itemId} that owns it -- one schema
+#                                entry covers every table under it, since base
+#                                table names are kept identical between Databricks
+#                                and Fabric (see README "Target resolution")
 #
 # The Deploy stage only runs against the `--apply` flag after an environment
 # approval gate (`fabric-security-prod`), keeping a human in the loop for any
