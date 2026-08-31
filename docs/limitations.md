@@ -3,6 +3,40 @@
 Validated against the scope's named scenarios plus additional gaps found
 while building and testing the extraction/translation logic.
 
+## Native Unity Catalog row filters / column masks (not covered)
+
+**Status: out of scope for this toolkit's current extraction path — read
+this before relying on the feasibility conclusion.** This spike's
+extraction utility only understands security logic *embedded in view SQL
+text* (the `CASE WHEN is_account_group_member(...) ...` dynamic-view
+pattern named in the ticket). Since Unity Catalog's GA release, many
+estates instead implement RLS/CLS **natively on tables**, independent of
+any view:
+
+```sql
+ALTER TABLE sec.hr.employee SET ROW FILTER hr.filter_by_region ON (region);
+ALTER TABLE sec.hr.employee ALTER COLUMN salary SET MASK hr.mask_salary;
+```
+
+These are not visible in `information_schema.views` at all — they live in
+`information_schema.table_row_filters` / `information_schema.column_masks`
+(or `SHOW ROW FILTERS`/`SHOW COLUMN MASKS`), and the actual filter/mask
+logic lives inside a separate SQL **function** body, not a `CASE`
+expression. `view_parser.py` does not read either of those, so if a target
+environment implements RLS/CLS this way, this toolkit currently extracts
+**nothing** for those tables.
+
+**Why this matters for the Go/No-Go call:** before committing production
+scope to this approach, run `SHOW ROW FILTERS`/`SHOW COLUMN MASKS` (or query
+`information_schema.table_row_filters`/`column_masks`) against a
+representative sample of the real target catalogs to determine which
+pattern is actually in use. If native row filters/column masks are the
+dominant pattern, extraction needs a second code path (querying those
+system tables, then parsing the referenced function's SQL body — a similar
+but distinct parsing problem from the current `CASE`-based matcher) before
+this toolkit covers the estate. The translation/role-building logic
+downstream of extraction does not need to change either way.
+
 ## Derived columns
 
 **Status: handled per the spike's key design assumption, validated by
@@ -108,6 +142,7 @@ these groups" semantic) but wasn't required to prove feasibility.
 
 | Scenario | Extraction | Translation | Recommended production follow-up |
 |---|---|---|---|
+| Native UC row filters / column masks (`ALTER TABLE ... SET ROW FILTER/MASK`) | **Not covered** | N/A | Confirm which pattern the real estate uses first (see above); build a second extraction path if native filters/masks are prevalent |
 | Derived columns | Full | Full (per assumption) | Extend to detect masks embedded inside derived expressions |
 | Simple CLS mask | Full | Full | — |
 | Simple RLS group gate | Full | Full | — |

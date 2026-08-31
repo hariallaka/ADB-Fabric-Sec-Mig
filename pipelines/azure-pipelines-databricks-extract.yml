@@ -1,0 +1,64 @@
+# Azure DevOps pipeline: Databricks-side extraction ONLY.
+#
+# This pipeline talks to Databricks and Databricks alone -- it never touches
+# a Fabric credential. It exists so extraction can be run, scheduled, and
+# permissioned independently of the Fabric-side translate/deploy pipeline
+# (pipelines/azure-pipelines-security-migration.yml), which is the interim
+# operating model documented in README.md ("Running the stages separately").
+#
+# Today: this pipeline typically runs under a Databricks-scoped service
+# connection/identity (see README.md "Databricks RBAC"), and its output
+# artifact is picked up by the Fabric-side pipeline via a `resources.pipelines`
+# reference (see that file). In the target end state, one Azure AD
+# application/service principal -- granted access on both sides per the same
+# README RBAC section -- can run both pipelines (or both stages of a single,
+# merged pipeline); nothing in the toolkit itself needs to change for that
+# consolidation, only which identity the pipeline runs as.
+#
+# Required pipeline variables / variable group ("dbx-fabric-security-migration"):
+#   DATABRICKS_TOKEN          - PAT or AAD service-principal token, scoped
+#                                per README "Databricks RBAC" (store as secret)
+#   DATABRICKS_WORKSPACE_URL  - e.g. https://adb-1234567890123456.7.azuredatabricks.net
+#   DATABRICKS_WAREHOUSE_ID   - SQL warehouse used to run the extraction query
+#   DATABRICKS_CATALOG        - Unity Catalog catalog to scan
+#   DATABRICKS_SCHEMA         - optional: restrict to one schema
+
+trigger: none # run on-demand or on a schedule; extraction should not block on every commit
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: dbx-fabric-security-migration
+  - name: pythonVersion
+    value: "3.11"
+  - name: outDir
+    value: "$(Pipeline.Workspace)/databricks-extract-out"
+
+stages:
+  - stage: ExtractFromDatabricks
+    displayName: "Extract view security definitions from Unity Catalog"
+    jobs:
+      - job: ExtractJob
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(pythonVersion)"
+          - script: |
+              pip install -e ./databricks-fabric-security-migration
+            displayName: "Install toolkit"
+          - script: |
+              python -m dbx_fabric_security.cli extract-databricks \
+                --workspace-url "$(DATABRICKS_WORKSPACE_URL)" \
+                --warehouse-id "$(DATABRICKS_WAREHOUSE_ID)" \
+                --catalog "$(DATABRICKS_CATALOG)" \
+                --schema "$(DATABRICKS_SCHEMA)" \
+                --token "$(DATABRICKS_TOKEN)" \
+                --execute \
+                --out-dir "$(outDir)"
+            displayName: "Pull view DDL from Unity Catalog and extract"
+          # Publishes both the raw extracted DDL (consumed by the Fabric-side
+          # pipeline's `--views` input) and the structured JSON (useful on its
+          # own for a Databricks-side security review, independent of Fabric).
+          - publish: "$(outDir)"
+            artifact: extracted-views

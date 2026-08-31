@@ -1,13 +1,26 @@
-# Azure DevOps pipeline: Databricks -> Fabric security migration.
+# Azure DevOps pipeline: Fabric-side translate/validate/deploy.
 #
-# Stages: Extract -> Translate -> Validate -> (manual approval) -> Deploy -> Report.
+# Stages: Resolve views input -> Translate -> Validate -> (manual approval) -> Deploy -> Report.
+#
+# This pipeline never talks to Databricks directly -- it consumes the
+# extraction artifact produced by the Databricks-side pipeline
+# (pipelines/azure-pipelines-databricks-extract.yml), or (for local
+# dev/test only) a checked-in SQL file. That split lets extraction run
+# under a Databricks-scoped identity and translate/deploy run under a
+# Fabric-scoped identity, per README.md's "Running the stages separately".
+# In the target end state, one Azure AD application/service principal with
+# access on both sides (README.md "RBAC / permissions required") can run
+# both pipelines; the split here is an interim operating model, not a
+# structural requirement of the toolkit -- `extractSource: localFile` plus
+# a `DATABRICKS_TOKEN` variable would let a single merged pipeline do both
+# in one run if that's preferred later.
 #
 # Required pipeline variables / variable group ("dbx-fabric-security-migration"):
 #   FABRIC_API_TOKEN          - service principal bearer token for the Fabric API
 #                                (issued via an Azure AD app registration with
 #                                Fabric API permissions; store as a secret variable)
-#   DATABRICKS_VIEWS_PATH     - path (in this repo or an artifact drop) to the
-#                                exported view DDL to process
+#   DATABRICKS_VIEWS_PATH     - only used when extractSource=localFile: path (in
+#                                this repo or an artifact drop) to exported view DDL
 #   AGS_EXPORT_PATH           - path to the latest AGS group export CSV
 #   FABRIC_DEPLOY_TARGETS     - path to the table -> {workspaceId, itemId} map
 #
@@ -16,6 +29,25 @@
 # change that actually mutates Fabric role assignments.
 
 trigger: none # run on-demand or via a schedule trigger; security changes should not auto-deploy on every commit
+
+parameters:
+  - name: extractSource
+    displayName: "Where should extracted view DDL come from?"
+    type: string
+    default: databricksPipeline
+    values:
+      - databricksPipeline # consume the artifact published by azure-pipelines-databricks-extract.yml (production default)
+      - localFile          # use $(DATABRICKS_VIEWS_PATH) directly (dev/test only, no Databricks connectivity needed)
+
+resources:
+  pipelines:
+    - pipeline: databricksExtract
+      # Must match the *name* of the Azure DevOps pipeline created from
+      # pipelines/azure-pipelines-databricks-extract.yml in this project.
+      # Update this to the real pipeline name once it exists; irrelevant
+      # when extractSource=localFile.
+      source: "Databricks Security Extraction"
+      trigger: none # set true to auto-run this pipeline whenever a Databricks extraction succeeds
 
 pool:
   vmImage: ubuntu-latest
@@ -28,29 +60,32 @@ variables:
     value: "$(Pipeline.Workspace)/security-migration-out"
 
 stages:
-  - stage: Extract
-    displayName: "Extract Databricks view security definitions"
+  - stage: ResolveViewsInput
+    displayName: "Resolve extracted view DDL input"
     jobs:
-      - job: ExtractJob
-        displayName: "Parse view DDL -> structured security model"
+      - job: ResolveViewsJob
         steps:
-          - task: UsePythonVersion@0
-            inputs:
-              versionSpec: "$(pythonVersion)"
-          - script: |
-              pip install -e ./databricks-fabric-security-migration
-            displayName: "Install toolkit"
-          - script: |
-              python -m dbx_fabric_security.cli extract \
-                --views "$(DATABRICKS_VIEWS_PATH)" \
-                --out-dir "$(outDir)"
-            displayName: "Run extraction"
-          - publish: "$(outDir)/view_security_definitions.json"
-            artifact: view-security-definitions
+          - ${{ if eq(parameters.extractSource, 'databricksPipeline') }}:
+              - download: databricksExtract
+                artifact: extracted-views
+              - script: |
+                  mkdir -p "$(outDir)"
+                  cp "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_views.sql" \
+                     "$(outDir)/extracted_views.sql"
+                  echo "##vso[task.setvariable variable=viewsPath;isOutput=true]$(outDir)/extracted_views.sql"
+                name: setViewsPath
+                displayName: "Use extraction artifact from Databricks pipeline"
+          - ${{ if eq(parameters.extractSource, 'localFile') }}:
+              - script: |
+                  echo "##vso[task.setvariable variable=viewsPath;isOutput=true]$(DATABRICKS_VIEWS_PATH)"
+                name: setViewsPath
+                displayName: "Use local view SQL file (dev/test)"
 
   - stage: Translate
     displayName: "Translate CLS/RLS into Fabric roles"
-    dependsOn: Extract
+    dependsOn: ResolveViewsInput
+    variables:
+      viewsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.viewsPath'] ]
     jobs:
       - job: TranslateJob
         steps:
@@ -62,13 +97,13 @@ stages:
             displayName: "Install toolkit"
           - script: |
               python -m dbx_fabric_security.cli translate \
-                --views "$(DATABRICKS_VIEWS_PATH)" \
+                --views "$(viewsPath)" \
                 --ags-export "$(AGS_EXPORT_PATH)" \
                 --out-dir "$(outDir)"
             displayName: "Run translation"
           - script: |
               python -m dbx_fabric_security.cli map-roles \
-                --views "$(DATABRICKS_VIEWS_PATH)" \
+                --views "$(viewsPath)" \
                 --ags-export "$(AGS_EXPORT_PATH)" \
                 --out-dir "$(outDir)"
             displayName: "Build AGS -> AD Group -> Fabric Role mapping"
@@ -120,7 +155,11 @@ stages:
 
   - stage: Deploy
     displayName: "Deploy Fabric roles"
-    dependsOn: DeployApproval
+    dependsOn:
+      - DeployApproval
+      - ResolveViewsInput
+    variables:
+      viewsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.viewsPath'] ]
     jobs:
       - job: DeployJob
         steps:
@@ -132,7 +171,7 @@ stages:
             displayName: "Install toolkit"
           - script: |
               python -m dbx_fabric_security.cli deploy \
-                --views "$(DATABRICKS_VIEWS_PATH)" \
+                --views "$(viewsPath)" \
                 --ags-export "$(AGS_EXPORT_PATH)" \
                 --targets "$(FABRIC_DEPLOY_TARGETS)" \
                 --bearer-token "$(FABRIC_API_TOKEN)" \

@@ -7,12 +7,15 @@ toolkit.
         --out-dir out/
 
 Subcommands:
-    extract       Parse view SQL -> per-view security definition JSON.
-    translate     Extract + translate -> CLS/RLS entitlement + Fabric role JSON.
-    map-roles     Translate + AGS export -> AGS/AD Group/Fabric Role mapping CSV.
-    deploy        Translate + a target map -> apply (or dry-run) Fabric roles.
-    run-all       Runs extract -> translate -> map-roles -> deploy(dry-run) and
-                  writes every artifact to --out-dir.
+    extract             Parse a local view SQL file -> per-view security definition JSON.
+    extract-databricks  Pull view DDL live from Unity Catalog, then extract (see
+                         README "Running the stages separately" -- this is the
+                         Databricks-side step, runnable independently of Fabric).
+    translate           Extract + translate -> CLS/RLS entitlement + Fabric role JSON.
+    map-roles           Translate + AGS export -> AGS/AD Group/Fabric Role mapping CSV.
+    deploy              Translate + a target map -> apply (or dry-run) Fabric roles.
+    run-all             Runs extract -> translate -> map-roles -> deploy(dry-run) and
+                        writes every artifact to --out-dir (local-file source only).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import json
 import os
 import sys
 
+from dbx_fabric_security.extractor.databricks_client import DatabricksApiClient
 from dbx_fabric_security.extractor.view_parser import parse_views_file
 from dbx_fabric_security.fabric_api.client import FabricApiClient
 from dbx_fabric_security.fabric_api.deploy import deploy_roles
@@ -74,6 +78,48 @@ def cmd_extract(args: argparse.Namespace) -> None:
     _write_json(os.path.join(args.out_dir, "view_security_definitions.json"), payload)
     print(f"Extracted {len(views)} view(s) -> {args.out_dir}/view_security_definitions.json")
     unsupported = [v.fq_name for v in views if v.unsupported_constructs]
+    if unsupported:
+        print(f"  {len(unsupported)} view(s) flagged for manual review: {unsupported}")
+
+
+def cmd_extract_databricks(args: argparse.Namespace) -> None:
+    """Databricks-side extraction step. Requires only Databricks connectivity
+    (workspace URL, SQL warehouse, and a token scoped per README's
+    "Databricks RBAC" section) -- no Fabric credentials are used here, so
+    this can run as its own Azure DevOps stage, its own pipeline, or even a
+    Databricks Job task, independently of the Fabric-side steps.
+    """
+    client = DatabricksApiClient(
+        workspace_url=args.workspace_url,
+        bearer_token=args.token,
+        dry_run=not args.execute,
+    )
+    ddl_by_view = client.fetch_view_ddl(args.warehouse_id, args.catalog, args.schema)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    sql_path = os.path.join(args.out_dir, "extracted_views.sql")
+
+    if not args.execute:
+        print(
+            "DRY-RUN: no Databricks call was made (pass --execute with a valid "
+            "--token to fetch live view DDL). Nothing written."
+        )
+        return
+
+    with open(sql_path, "w", encoding="utf-8") as fh:
+        for ddl in ddl_by_view.values():
+            fh.write(ddl.rstrip().rstrip(";") + ";\n\n")
+
+    print(f"Fetched {len(ddl_by_view)} view definition(s) from {args.catalog} -> {sql_path}")
+
+    # Reuse the exact same parsing path as the file-based `extract` command so
+    # downstream translate/map-roles/deploy behave identically regardless of
+    # whether extraction ran against a live workspace or a static SQL file.
+    views = parse_views_file(sql_path)
+    payload = [dataclasses.asdict(v) for v in views]
+    _write_json(os.path.join(args.out_dir, "view_security_definitions.json"), payload)
+    unsupported = [v.fq_name for v in views if v.unsupported_constructs]
+    print(f"Extracted {len(views)} view(s) -> {args.out_dir}/view_security_definitions.json")
     if unsupported:
         print(f"  {len(unsupported)} view(s) flagged for manual review: {unsupported}")
 
@@ -179,9 +225,22 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--views", required=True, help="Path to a .sql file containing CREATE VIEW statements")
         p.add_argument("--out-dir", default="out", help="Directory to write output artifacts to")
 
-    p_extract = sub.add_parser("extract", help="Parse view SQL into structured security definitions")
+    p_extract = sub.add_parser("extract", help="Parse a local view SQL file into structured security definitions")
     common(p_extract)
     p_extract.set_defaults(func=cmd_extract)
+
+    p_extract_dbx = sub.add_parser(
+        "extract-databricks",
+        help="Pull view DDL live from Unity Catalog (Databricks-side step, no Fabric credentials used)",
+    )
+    p_extract_dbx.add_argument("--workspace-url", required=True, help="e.g. https://adb-1234567890123456.7.azuredatabricks.net")
+    p_extract_dbx.add_argument("--warehouse-id", required=True, help="SQL warehouse id used to run the extraction query")
+    p_extract_dbx.add_argument("--catalog", required=True, help="Unity Catalog catalog to scan")
+    p_extract_dbx.add_argument("--schema", default=None, help="Restrict to one schema (default: whole catalog)")
+    p_extract_dbx.add_argument("--token", default=os.environ.get("DATABRICKS_TOKEN"), help="PAT or AAD service-principal token; defaults to $DATABRICKS_TOKEN")
+    p_extract_dbx.add_argument("--execute", action="store_true", help="Actually call Databricks (default: dry-run, no network call)")
+    p_extract_dbx.add_argument("--out-dir", default="out", help="Directory to write extracted_views.sql and view_security_definitions.json to")
+    p_extract_dbx.set_defaults(func=cmd_extract_databricks)
 
     p_translate = sub.add_parser("translate", help="Extract + translate into CLS/RLS entitlements and Fabric roles")
     common(p_translate)

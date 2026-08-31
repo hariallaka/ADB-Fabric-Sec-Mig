@@ -35,6 +35,33 @@ membership; this toolkit never creates, edits, or deletes AD groups or AGS
 records -- it only reads the AGS export to resolve group names to Entra
 object ids for role `members` payloads.
 
+## Pipeline split (interim) vs. target state
+
+```mermaid
+flowchart TD
+    subgraph DBXSIDE["Databricks-side (today: Databricks-scoped identity)"]
+        direction TB
+        DBX["azure-pipelines-databricks-extract.yml\n(extract-databricks)"]
+    end
+    subgraph FABSIDE["Fabric-side (today: Fabric-scoped identity)"]
+        direction TB
+        FAB["azure-pipelines-security-migration.yml\n(translate -> validate -> approve -> deploy)"]
+    end
+    DBX -- "extracted-views artifact\n(pipeline resource)" --> FAB
+
+    TARGET["Target state: one Azure DevOps pipeline,\none Azure AD identity with both\nDatabricks + Fabric RBAC (see README)"]
+    DBXSIDE -.consolidates into.-> TARGET
+    FABSIDE -.consolidates into.-> TARGET
+```
+
+Today the two pipelines run under separate identities/service connections so
+each side can be permissioned minimally and independently (see README.md,
+"RBAC / permissions required"). Neither the extraction code nor the
+translate/deploy code changes to support the target state -- consolidating
+onto one Azure AD application that holds both sets of grants, and one
+pipeline (or one pipeline with two stages using that identity), is purely a
+credentials/pipeline-wiring change.
+
 ## Component responsibilities
 
 | Component | Responsibility | Source |
