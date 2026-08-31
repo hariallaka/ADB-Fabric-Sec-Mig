@@ -1,0 +1,157 @@
+# Azure DevOps pipeline: Databricks -> Fabric security migration.
+#
+# Stages: Extract -> Translate -> Validate -> (manual approval) -> Deploy -> Report.
+#
+# Required pipeline variables / variable group ("dbx-fabric-security-migration"):
+#   FABRIC_API_TOKEN          - service principal bearer token for the Fabric API
+#                                (issued via an Azure AD app registration with
+#                                Fabric API permissions; store as a secret variable)
+#   DATABRICKS_VIEWS_PATH     - path (in this repo or an artifact drop) to the
+#                                exported view DDL to process
+#   AGS_EXPORT_PATH           - path to the latest AGS group export CSV
+#   FABRIC_DEPLOY_TARGETS     - path to the table -> {workspaceId, itemId} map
+#
+# The Deploy stage only runs against the `--apply` flag after an environment
+# approval gate (`fabric-security-prod`), keeping a human in the loop for any
+# change that actually mutates Fabric role assignments.
+
+trigger: none # run on-demand or via a schedule trigger; security changes should not auto-deploy on every commit
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: dbx-fabric-security-migration
+  - name: pythonVersion
+    value: "3.11"
+  - name: outDir
+    value: "$(Pipeline.Workspace)/security-migration-out"
+
+stages:
+  - stage: Extract
+    displayName: "Extract Databricks view security definitions"
+    jobs:
+      - job: ExtractJob
+        displayName: "Parse view DDL -> structured security model"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(pythonVersion)"
+          - script: |
+              pip install -e ./databricks-fabric-security-migration
+            displayName: "Install toolkit"
+          - script: |
+              python -m dbx_fabric_security.cli extract \
+                --views "$(DATABRICKS_VIEWS_PATH)" \
+                --out-dir "$(outDir)"
+            displayName: "Run extraction"
+          - publish: "$(outDir)/view_security_definitions.json"
+            artifact: view-security-definitions
+
+  - stage: Translate
+    displayName: "Translate CLS/RLS into Fabric roles"
+    dependsOn: Extract
+    jobs:
+      - job: TranslateJob
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(pythonVersion)"
+          - script: |
+              pip install -e ./databricks-fabric-security-migration
+            displayName: "Install toolkit"
+          - script: |
+              python -m dbx_fabric_security.cli translate \
+                --views "$(DATABRICKS_VIEWS_PATH)" \
+                --ags-export "$(AGS_EXPORT_PATH)" \
+                --out-dir "$(outDir)"
+            displayName: "Run translation"
+          - script: |
+              python -m dbx_fabric_security.cli map-roles \
+                --views "$(DATABRICKS_VIEWS_PATH)" \
+                --ags-export "$(AGS_EXPORT_PATH)" \
+                --out-dir "$(outDir)"
+            displayName: "Build AGS -> AD Group -> Fabric Role mapping"
+          - publish: "$(outDir)"
+            artifact: translated-security-model
+
+  - stage: Validate
+    displayName: "Validate translation output"
+    dependsOn: Translate
+    jobs:
+      - job: ValidateJob
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(pythonVersion)"
+          - script: |
+              pip install -e ./databricks-fabric-security-migration
+              pip install pytest
+            displayName: "Install toolkit + test deps"
+          - script: |
+              pytest ./databricks-fabric-security-migration/tests -v
+            displayName: "Run unit tests"
+          - download: current
+            artifact: translated-security-model
+          - script: |
+              python - <<'PY'
+              import json, sys
+              path = "$(Pipeline.Workspace)/translated-security-model/fabric_data_access_roles.json"
+              roles = json.load(open(path))
+              unresolved = [r["name"] for r in roles if r.get("unresolvedAdGroupObjectId")]
+              if unresolved:
+                  print(f"::warning::{len(unresolved)} role(s) reference an AD group missing from "
+                        f"the AGS export and cannot be deployed as-is: {unresolved}")
+              print(f"Validated {len(roles)} Fabric role definition(s).")
+              PY
+            displayName: "Flag unresolved AD group mappings"
+
+  - stage: DeployApproval
+    displayName: "Manual approval gate"
+    dependsOn: Validate
+    jobs:
+      - deployment: ApprovalGate
+        environment: "fabric-security-prod" # configure required-reviewer check on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: echo "Approved for deployment"
+
+  - stage: Deploy
+    displayName: "Deploy Fabric roles"
+    dependsOn: DeployApproval
+    jobs:
+      - job: DeployJob
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(pythonVersion)"
+          - script: |
+              pip install -e ./databricks-fabric-security-migration
+            displayName: "Install toolkit"
+          - script: |
+              python -m dbx_fabric_security.cli deploy \
+                --views "$(DATABRICKS_VIEWS_PATH)" \
+                --ags-export "$(AGS_EXPORT_PATH)" \
+                --targets "$(FABRIC_DEPLOY_TARGETS)" \
+                --bearer-token "$(FABRIC_API_TOKEN)" \
+                --apply \
+                --out-dir "$(outDir)"
+            displayName: "Deploy roles to Fabric (live)"
+          - publish: "$(outDir)/deployment_report.json"
+            artifact: deployment-report
+
+  - stage: Report
+    displayName: "Publish governance report"
+    dependsOn: Deploy
+    condition: always()
+    jobs:
+      - job: ReportJob
+        steps:
+          - download: current
+            artifact: deployment-report
+          - download: current
+            artifact: translated-security-model
+          - publish: "$(Pipeline.Workspace)"
+            artifact: security-migration-run-$(Build.BuildId)
