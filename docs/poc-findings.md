@@ -7,20 +7,26 @@ pip install -e .
 python -m dbx_fabric_security.cli run-all \
   --views tests/fixtures/sample_views.sql \
   --grants tests/fixtures/grants_sample.csv \
+  --table-columns tests/fixtures/table_columns_sample.json \
   --targets tests/fixtures/deploy_targets_sample.json \
   --out-dir out/demo
 pytest tests/ -v
 ```
 
-## Test suite: 43/43 passing
+## Test suite: 52/52 passing
 
 ```
 tests/test_cls_translator.py::test_derived_column_never_gets_direct_entitlement PASSED
 tests/test_cls_translator.py::test_every_grantee_gets_every_flattened_column PASSED
 tests/test_cls_translator.py::test_view_with_no_grantees_produces_no_entitlements PASSED
+tests/test_cls_translator.py::test_join_column_attributed_to_its_real_table_when_schema_supplied PASSED
+tests/test_cls_translator.py::test_join_column_falls_back_with_no_schema_supplied PASSED
 tests/test_databricks_client.py::test_dry_run_never_calls_network_and_returns_empty PASSED
 tests/test_databricks_client.py::test_fetch_view_ddl_dry_run_returns_empty_mapping PASSED
 tests/test_databricks_client.py::test_fetch_view_grants_dry_run_returns_empty_mapping PASSED
+tests/test_databricks_client.py::test_fetch_table_columns_dry_run_returns_empty_mapping PASSED
+tests/test_databricks_client.py::test_fetch_table_columns_batches_one_query_per_catalog PASSED
+tests/test_databricks_client.py::test_fetch_table_columns_reconstruction_shape PASSED
 tests/test_databricks_client.py::test_grants_reconstruction_shape PASSED
 tests/test_databricks_client.py::test_fetch_principal_object_id_dry_run_returns_unknown PASSED
 tests/test_databricks_client.py::test_fetch_principal_directory_dry_run_returns_empty PASSED
@@ -58,8 +64,12 @@ tests/test_view_parser.py::test_nested_and_or_where_clause_preserved PASSED
 tests/test_view_parser.py::test_nested_view_flagged PASSED
 tests/test_view_parser.py::test_complex_view_flagged_but_still_flattened PASSED
 tests/test_view_parser.py::test_reformatted_select_sql_matches_spike_example PASSED
+tests/test_view_parser.py::test_qualified_columns_in_join_resolve_correctly_without_table_columns PASSED
+tests/test_view_parser.py::test_unqualified_join_column_misattribution_is_flagged_without_schema PASSED
+tests/test_view_parser.py::test_unqualified_join_column_resolves_correctly_with_table_columns PASSED
+tests/test_view_parser.py::test_ambiguous_column_present_in_two_tables_is_flagged_not_guessed PASSED
 
-43 passed in 0.33s
+52 passed in 0.37s
 ```
 
 ## AC1 — CLS feasibility: evidence
@@ -96,6 +106,46 @@ because `grants_sample.csv` records `finance_readers` holding `SELECT` on
 the view. **Structured export (AC1 requirement):** both JSON
 (`cls_entitlements.json`) and CSV (`cls_entitlements.csv`) are produced by
 `dbx_fabric_security.cli translate`.
+
+**Column-to-table attribution in a join** (`tests/fixtures/sample_views.sql`,
+view 8) — a real correctness gap found and fixed during this spike:
+
+```sql
+CREATE OR REPLACE VIEW sec.sales.v_orders_with_region_name AS
+SELECT order_id, amount, region_name  -- region_name is UNQUALIFIED
+FROM sec.sales.orders o
+JOIN sec.sales.regions r ON o.region = r.region_code;
+```
+
+`region_name` actually lives on `regions`, not `orders`. Extracted twice —
+once without `--table-columns`, once with
+`tests/fixtures/table_columns_sample.json`:
+
+```
+Without --table-columns: column_source_tables["region_name"] == "sec.sales.orders"   (WRONG, flagged)
+With    --table-columns: column_source_tables["region_name"] == "sec.sales.regions"  (correct, unflagged)
+```
+
+The "without" case still produces a CLS entitlement (nothing silently
+dropped) but explicitly flags it:
+
+```
+Column 'region_name' is unqualified in a multi-table view; no table-columns
+schema was supplied to resolve it, so it was attributed to
+'sec.sales.orders' as an unverified fallback -- supply table_columns
+(live: DatabricksApiClient.fetch_table_columns, offline: --table-columns)
+or qualify the column in the view.
+```
+
+Enforced end to end by
+`tests/test_cls_translator.py::test_join_column_attributed_to_its_real_table_when_schema_supplied`
+and `test_join_column_falls_back_with_no_schema_supplied`, and at the
+extraction layer by
+`tests/test_view_parser.py::test_unqualified_join_column_resolves_correctly_with_table_columns`,
+`test_unqualified_join_column_misattribution_is_flagged_without_schema`, and
+`test_ambiguous_column_present_in_two_tables_is_flagged_not_guessed` (a
+column present in *more than one* supplied table's schema is flagged, not
+guessed at either).
 
 ## AC2 — RLS feasibility: evidence, including the OR edge case
 
@@ -183,19 +233,22 @@ blank `principal_object_id`. The resulting role comes back
 or dropped:
 
 ```
-Role mapping rows: 9 -> out/demo/role_mapping.csv
+Role mapping rows: 11 -> out/demo/role_mapping.csv
   WARNING: 1 principal(s) have no known object id (not in --grants'
   principal_object_id column): ['hr_contractor']
 ```
 
-AD Group/principal → Fabric Role mapping (`out/demo/role_mapping.csv`, 9
-rows generated from 7 fixture views; excerpt below):
+AD Group/principal → Fabric Role mapping (`out/demo/role_mapping.csv`, 11
+rows generated from 8 fixture views; excerpt below, including the new
+`sec.sales.regions` role from the column-attribution fix demonstrated
+above):
 
 ```
 principalName,principalObjectId,fabricRoleName,oneLakeObject,columnPermitCount,rowFilters
 finance_readers,7c3a4e10-1111-...-000000000001,role_sec_finance_table1_finance_readers,sec.finance.table1,2,["TRUE"]
 sales_region_us,7c3a4e10-3333-...-000000000003,role_sec_sales_orders_sales_region_us,sec.sales.orders,4,["region = 'US' OR region = 'CA'"]
 hr_contractor,,role_sec_hr_employee_hr_contractor,sec.hr.employee,3,["dept = 'Engineering' AND active = TRUE"]
+sales_finance,7c3a4e10-5555-...-000000000005,role_sec_sales_regions_sales_finance,sec.sales.regions,1,["TRUE"]
 ```
 
 **Automated deployment feasibility, including schema-level target
@@ -205,12 +258,15 @@ resolve to one Fabric Lakehouse item) plus one exact-table override
 (`sec.sales.order_lines`, routed to a different item than its schema
 default) — demonstrating the table-name-parity simplification: neither
 `sec.finance.table1` nor `sec.finance.expense_reports` is listed
-individually, yet both resolve correctly via the single `sec.finance` entry.
-`cli deploy` (dry-run by default) produced a deployment plan/report for 5
-target Lakehouse items without any live network call:
+individually, yet both resolve correctly via the single `sec.finance` entry
+-- and `sec.sales.regions`, a table that only entered the picture via the
+column-attribution fix above, resolves via that same `sec.sales` schema
+default with no fixture change needed at all. `cli deploy` (dry-run by
+default) produced a deployment plan/report for 6 target Lakehouse items
+without any live network call:
 
 ```
-Deployment (DRY-RUN): 5 item(s) targeted -> out/demo/deployment_report.json
+Deployment (DRY-RUN): 6 item(s) targeted -> out/demo/deployment_report.json
   Skipped -- these are Databricks VIEWS (a nested view's base), not physical
   tables, so they have no Fabric counterpart under table-only migration:
   ['sec.hr.v_employee_basic']
@@ -222,6 +278,7 @@ sec.finance.table1          -> item 22222222...  (via "sec.finance" schema defau
 sec.hr.employee             -> item 33333333...  (via "sec.hr" schema default)
 sec.sales.order_lines       -> item 55555555...  (via exact "tables" override, NOT the sales schema default)
 sec.sales.orders            -> item 44444444...  (via "sec.sales" schema default)
+sec.sales.regions           -> item 44444444...  (via "sec.sales" schema default)
 ```
 
 The one skipped table is `sec.hr.v_employee_basic`, a **view**, not a
@@ -237,19 +294,26 @@ Fabric table that doesn't exist. Enforced by
 
 ## AC5 — Limitation coverage: evidence
 
-Out of the 7 fixture views, extraction correctly flagged the 2 views that
+Out of the 8 fixture views, extraction correctly flagged the 3 views that
 should require manual review:
 
 ```
-Extracted 7 view(s) -> out/demo/view_security_definitions.json
-  2 view(s) flagged for manual review:
-    ['sec.hr.v_employee_export', 'sec.sales.v_regional_totals']
+Extracted 8 view(s) -> out/demo/view_security_definitions.json
+  3 view(s) flagged for manual review:
+    ['sec.hr.v_employee_export', 'sec.sales.v_regional_totals',
+     'sec.sales.v_orders_with_region_name']
 ```
 
 - `v_employee_export` — nested view (built on `v_employee_basic`).
 - `v_regional_totals` — complex view (JOIN + GROUP BY); still correctly
   flattened `region` and `amount` (from `SUM(o.amount)`) as CLS-eligible
   columns, excluding the derived alias `total_amount`.
+- `v_orders_with_region_name` — join with an unqualified column
+  (§AC1 above); still carries the generic JOIN-complexity note (which fires
+  for any join regardless of WHERE clause) even when `--table-columns`
+  fully resolves its column attribution -- this view has no WHERE clause,
+  so the still-open RLS row-filter gap doesn't apply to it specifically,
+  but the flag is intentionally blanket rather than view-by-view precise.
 
 Both were still parsed on a best-effort basis, but are marked
 `unsupported_constructs`-non-empty so an automation pipeline can gate

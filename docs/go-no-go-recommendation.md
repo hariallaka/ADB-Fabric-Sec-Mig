@@ -5,12 +5,14 @@
 Automated translation of Databricks Unity Catalog view-based access into
 Microsoft Fabric OneLake security roles is **technically viable** and was
 demonstrated end-to-end in this spike's proof of concept: extraction (Unity
-Catalog SELECT grants, principal object ids via SCIM, and view shape),
-translation (including the derived-column assumption and verbatim
-WHERE-clause reproduction, including OR-joined predicates), AD
-Group/principal-to-Fabric-role mapping, and a dry-run automated deployment
-all work against representative view patterns, with 37/37 automated tests
-passing (see [poc-findings.md](./poc-findings.md)).
+Catalog SELECT grants, principal object ids via SCIM, and view shape,
+including correctly attributing a joined view's unqualified columns to
+their real source table rather than guessing), translation (including the
+derived-column assumption and verbatim WHERE-clause reproduction, including
+OR-joined predicates), AD Group/principal-to-Fabric-role mapping, and a
+dry-run automated deployment all work against representative view
+patterns, with 52/52 automated tests passing (see
+[poc-findings.md](./poc-findings.md)).
 
 The model settled on is deliberately simple: a view's grantees come from
 Unity Catalog's actual `SELECT` grants (queried directly, never inferred

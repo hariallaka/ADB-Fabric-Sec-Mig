@@ -25,6 +25,14 @@ class ViewDefinition:
     # direct pass-throughs and the columns feeding derived expressions --
     # in first-seen order, with derived output aliases themselves excluded.
     select_columns: list[str]
+    # Which physical base table each entry in select_columns actually came
+    # from -- trivial for a single-table view, resolved via the FROM/JOIN
+    # alias map for a column the SQL itself qualifies (e.g. t1.a), and via
+    # an optional live table-columns lookup for an unqualified column in a
+    # multi-table view. Always populated (falls back to base_tables[0] with
+    # an unsupported_constructs entry when it can't be resolved safely --
+    # see view_parser.py and README "Column-to-table attribution").
+    column_source_tables: dict[str, str]
     derived_output_columns: list[str]
     references_views: list[str]
     is_complex: bool

@@ -166,6 +166,45 @@ class DatabricksApiClient:
                 grants_by_view[fq_name].append(grantee)
         return grants_by_view
 
+    def fetch_table_columns(self, warehouse_id: str, table_fqns: list[str]) -> dict[str, list[str]]:
+        """Returns ``{catalog.schema.table: [column_name, ...]}`` for the
+        given fully-qualified base tables, via each referenced catalog's
+        ``information_schema.columns``.
+
+        This is what makes column-to-table attribution for a joined view
+        deterministic rather than a guess: an unqualified column in a view's
+        SELECT list can be matched against each candidate table's real
+        column list (see ``view_parser._resolve_select_columns``). Requests
+        are batched one query per distinct catalog among ``table_fqns``.
+        """
+        by_catalog: dict[str, list[str]] = {}
+        for fqn in table_fqns:
+            parts = fqn.split(".")
+            if len(parts) != 3:
+                continue
+            catalog, schema, table = parts
+            by_catalog.setdefault(catalog, []).append(f"{schema}.{table}")
+
+        columns_by_table: dict[str, list[str]] = {}
+        for catalog, schema_tables in by_catalog.items():
+            quoted = ", ".join("'" + st.replace("'", "''") + "'" for st in schema_tables)
+            statement = (
+                "SELECT table_catalog, table_schema, table_name, column_name "
+                f"FROM {catalog}.information_schema.columns "
+                f"WHERE CONCAT(table_schema, '.', table_name) IN ({quoted}) "
+                "ORDER BY ordinal_position"
+            )
+            result = self.execute_statement(warehouse_id, statement)
+            if result.dry_run:
+                continue
+
+            rows = result.response_body.get("result", {}).get("data_array", [])
+            for cat, sch, name, column_name in rows:
+                fq_name = f"{cat}.{sch}.{name}"
+                columns_by_table.setdefault(fq_name, []).append(column_name)
+
+        return columns_by_table
+
     def _scim_lookup(self, resource: str, filter_field: str, value: str) -> dict | None:
         url = f"{self.workspace_url}/api/2.0/preview/scim/v2/{resource}"
         escaped = value.replace('"', '\\"')

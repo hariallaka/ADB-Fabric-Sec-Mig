@@ -1,0 +1,8 @@
+{
+  "sec.finance.table1": ["a", "b"],
+  "sec.hr.employee": ["emp_id", "name", "dept", "active"],
+  "sec.sales.orders": ["order_id", "customer", "region", "amount", "active"],
+  "sec.sales.order_lines": ["order_id", "customer", "unit_price", "quantity", "region", "status", "priority"],
+  "sec.sales.regions": ["region_code", "region_name"],
+  "sec.finance.expense_reports": ["report_id", "submitted_by", "amount"]
+}

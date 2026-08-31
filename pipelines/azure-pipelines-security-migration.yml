@@ -27,6 +27,12 @@
 #                                their Azure AD object id; this is the sole source
 #                                of CLS/RLS access, never inferred from view SQL
 #                                or from any AD-Group-Sync (AGS) export
+#   DATABRICKS_TABLE_COLUMNS_PATH - only used when extractSource=localFile: path to
+#                                a JSON file {catalog.schema.table: [col1, col2, ...]}
+#                                used to correctly attribute an unqualified column in
+#                                a joined view to its real source table (see README
+#                                "Column-to-table attribution"); optional -- omitting
+#                                it just falls back to the first base table, flagged
 #   FABRIC_DEPLOY_TARGETS     - path to a JSON file with "schemas" and/or "tables"
 #                                keys mapping a Databricks catalog.schema (or an
 #                                exact catalog.schema.table override) to the Fabric
@@ -85,16 +91,20 @@ stages:
                      "$(outDir)/extracted_views.sql"
                   cp "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_grants.csv" \
                      "$(outDir)/extracted_grants.csv"
+                  cp "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_table_columns.json" \
+                     "$(outDir)/extracted_table_columns.json"
                   echo "##vso[task.setvariable variable=viewsPath;isOutput=true]$(outDir)/extracted_views.sql"
                   echo "##vso[task.setvariable variable=grantsPath;isOutput=true]$(outDir)/extracted_grants.csv"
+                  echo "##vso[task.setvariable variable=tableColumnsPath;isOutput=true]$(outDir)/extracted_table_columns.json"
                 name: setViewsPath
                 displayName: "Use extraction artifact from Databricks pipeline"
           - ${{ if eq(parameters.extractSource, 'localFile') }}:
               - script: |
                   echo "##vso[task.setvariable variable=viewsPath;isOutput=true]$(DATABRICKS_VIEWS_PATH)"
                   echo "##vso[task.setvariable variable=grantsPath;isOutput=true]$(DATABRICKS_GRANTS_PATH)"
+                  echo "##vso[task.setvariable variable=tableColumnsPath;isOutput=true]$(DATABRICKS_TABLE_COLUMNS_PATH)"
                 name: setViewsPath
-                displayName: "Use local view SQL + grants CSV (dev/test)"
+                displayName: "Use local view SQL + grants CSV + table-columns JSON (dev/test)"
 
   - stage: Translate
     displayName: "Translate CLS/RLS into Fabric roles"
@@ -102,6 +112,7 @@ stages:
     variables:
       viewsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.viewsPath'] ]
       grantsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.grantsPath'] ]
+      tableColumnsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.tableColumnsPath'] ]
     jobs:
       - job: TranslateJob
         steps:
@@ -115,12 +126,14 @@ stages:
               python -m dbx_fabric_security.cli translate \
                 --views "$(viewsPath)" \
                 --grants "$(grantsPath)" \
+                --table-columns "$(tableColumnsPath)" \
                 --out-dir "$(outDir)"
             displayName: "Run translation"
           - script: |
               python -m dbx_fabric_security.cli map-roles \
                 --views "$(viewsPath)" \
                 --grants "$(grantsPath)" \
+                --table-columns "$(tableColumnsPath)" \
                 --out-dir "$(outDir)"
             displayName: "Build AD Group/principal -> Fabric Role mapping"
           - publish: "$(outDir)"
@@ -178,6 +191,7 @@ stages:
     variables:
       viewsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.viewsPath'] ]
       grantsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.grantsPath'] ]
+      tableColumnsPath: $[ stageDependencies.ResolveViewsInput.ResolveViewsJob.outputs['setViewsPath.tableColumnsPath'] ]
     jobs:
       - job: DeployJob
         steps:
@@ -191,6 +205,7 @@ stages:
               python -m dbx_fabric_security.cli deploy \
                 --views "$(viewsPath)" \
                 --grants "$(grantsPath)" \
+                --table-columns "$(tableColumnsPath)" \
                 --targets "$(FABRIC_DEPLOY_TARGETS)" \
                 --bearer-token "$(FABRIC_API_TOKEN)" \
                 --apply \

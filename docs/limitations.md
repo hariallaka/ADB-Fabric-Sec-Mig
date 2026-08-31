@@ -58,22 +58,45 @@ reachable through another view (a nested view — see below), the source
 column resolves at the immediate view's level only; it is not traced
 further back through the base view's definition.
 
-## Complex view definitions
+## Complex view definitions (joins)
 
-**Status: detected and flagged, not blindly translated.** Any view with a
-`JOIN`, `GROUP BY`, window function, subquery, or `UNION` is marked
-`is_complex = true` and added to `unsupported_constructs`; the flattened
-column list and WHERE clause are still extracted on a best-effort basis
-(and were shown to work correctly for a straightforward join+aggregate
-example in the PoC — see `sec.sales.v_regional_totals`), but output for
-such views should be treated as a starting point for manual review, not an
-auto-deployable result. **Rationale for not attempting full correctness:**
-once multiple tables are joined, `base_tables` returns more than one table
-and the toolkit's `(table, principal)` role model has no way to decide
-which table a merged column or predicate really belongs to (`role_builder`
-currently keys off `base_tables[0]`, i.e. the first table encountered) —
-this needs a case-by-case decision by a data engineer reviewing the flagged
-view, not a fully automated rule.
+**Status: CLS column-to-table attribution is solved; RLS row-filter
+attribution is not (and is architecturally harder).** Any view with a
+`JOIN`, `GROUP BY`, window function, subquery, or `UNION` is still marked
+`is_complex = true` and added to `unsupported_constructs`, but the two
+things that flag covers are no longer the same risk:
+
+- **CLS (which table a column belongs to):** solved. Each entry in
+  `select_columns` is resolved to its real source table
+  (`ViewDefinition.column_source_tables`), not blanket-attributed to
+  `base_tables[0]`. A column the view's SQL qualifies (`t1.a`) resolves
+  directly via the FROM/JOIN alias map. An unqualified column resolves
+  deterministically once each candidate table's real column list is known
+  (`DatabricksApiClient.fetch_table_columns` / `--table-columns`) — and
+  that resolution is genuinely deterministic, not a best guess: Databricks/
+  Spark SQL refuses to `CREATE VIEW` in the first place if an unqualified
+  reference is ambiguous across the joined tables, so once the schemas are
+  known there is at most one correct answer (barring a table's schema
+  drifting *after* the view was created, which is still flagged, not
+  guessed at — see below). Without a table-columns schema supplied, an
+  unqualified column in a multi-table view still falls back to
+  `base_tables[0]`, exactly as before this fix — but now says so
+  explicitly per column in `unsupported_constructs`, rather than silently.
+  A column present in more than one supplied table's schema (schema drift,
+  not a compile-time-valid ambiguity) is likewise flagged, not guessed.
+- **RLS (which table a WHERE-clause predicate belongs to):** still not
+  attempted. A WHERE clause spanning columns from multiple joined tables
+  has no single physical table to become a Fabric row filter against —
+  Fabric's per-table row filter can't express a cross-table predicate
+  without the join itself, so `rls_translator.py` still attributes the
+  whole predicate to `base_tables[0]` unconditionally. This is a harder,
+  architecturally distinct problem from column attribution (there's no
+  equivalent "ask the table for its schema" fix — it would require
+  decomposing the predicate by which table each referenced column
+  actually belongs to, and deciding what a single-table row filter should
+  even mean for a condition that inherently spans two tables). Output for
+  a multi-table view's row filter should still be treated as a starting
+  point for manual review, not an auto-deployable result.
 
 ## Nested views
 
@@ -148,7 +171,8 @@ dropped.
 | WHERE clause with AND | Full (verbatim) | Full (verbatim) | — |
 | WHERE clause with OR / nested AND-OR | Full (verbatim) | Full (verbatim) | — |
 | Nested views | Detected | Grants/filters not composed | Add topological resolution pass |
-| Complex views (join/agg/window/union) | Best-effort, flagged | Best-effort, keyed to first base table | Manual review per flagged view |
+| Complex views: CLS column-to-table attribution | Full, given `table_columns`; flagged fallback without it | Full -- each column's real table, not a blanket guess | Supply `table_columns`/`--table-columns` (or `fetch_table_columns` live) for every join |
+| Complex views: RLS row-filter table attribution | Not attempted | Keyed to first base table unconditionally | Manual review per flagged multi-table view |
 | `SELECT *` views | Flagged, skipped | N/A | Resolve schema out of band before parsing |
 | Individual-user grants | Full | Full, flagged unresolved if SCIM can't match | Decide production posture for non-group grants |
 | Non-view UC table grants | Not in scope | N/A | Separate, simpler translation path |

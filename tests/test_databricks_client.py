@@ -20,6 +20,54 @@ def test_fetch_view_grants_dry_run_returns_empty_mapping():
     assert grants == {}
 
 
+def test_fetch_table_columns_dry_run_returns_empty_mapping():
+    client = DatabricksApiClient(workspace_url="https://example.azuredatabricks.net", dry_run=True)
+    columns = client.fetch_table_columns("wh-1", ["sec.sales.orders", "sec.sales.regions"])
+    assert columns == {}
+
+
+def test_fetch_table_columns_batches_one_query_per_catalog():
+    client = DatabricksApiClient(workspace_url="https://example.azuredatabricks.net", dry_run=True)
+    captured_statements = []
+
+    class _FakeResult:
+        dry_run = False
+        response_body = {"result": {"data_array": []}}
+
+    def fake_execute(warehouse_id, statement):
+        captured_statements.append(statement)
+        return _FakeResult()
+
+    client.execute_statement = fake_execute
+    client.fetch_table_columns("wh-1", ["sec.sales.orders", "sec.sales.regions", "other.hr.employee"])
+
+    assert len(captured_statements) == 2  # one per distinct catalog: "sec", "other"
+    sec_stmt = [s for s in captured_statements if s.startswith("SELECT table_catalog, table_schema, table_name, column_name FROM sec.")][0]
+    assert "'sales.orders'" in sec_stmt
+    assert "'sales.regions'" in sec_stmt
+
+
+def test_fetch_table_columns_reconstruction_shape():
+    client = DatabricksApiClient(workspace_url="https://example.azuredatabricks.net", dry_run=True)
+
+    class _FakeResult:
+        dry_run = False
+        response_body = {
+            "result": {
+                "data_array": [
+                    ["sec", "sales", "orders", "order_id"],
+                    ["sec", "sales", "orders", "amount"],
+                    ["sec", "sales", "orders", "region"],
+                ]
+            }
+        }
+
+    client.execute_statement = lambda warehouse_id, statement: _FakeResult()  # noqa: E731
+    columns = client.fetch_table_columns("wh-1", ["sec.sales.orders"])
+
+    assert columns == {"sec.sales.orders": ["order_id", "amount", "region"]}
+
+
 def test_grants_reconstruction_shape():
     client = DatabricksApiClient(workspace_url="https://example.azuredatabricks.net", dry_run=True)
 

@@ -69,7 +69,7 @@ the same way as `AND` — verbatim, by construction, not as a special case
 | Interactive notebook extraction (logged-in-user identity) | [`notebooks/`](notebooks/) |
 | Azure DevOps pipeline — Databricks-side extraction | [`pipelines/azure-pipelines-databricks-extract.yml`](pipelines/azure-pipelines-databricks-extract.yml) |
 | Azure DevOps pipeline — Fabric-side translate/deploy | [`pipelines/azure-pipelines-security-migration.yml`](pipelines/azure-pipelines-security-migration.yml) |
-| Automated tests (37 passing) | [`tests/`](tests/) |
+| Automated tests (52 passing) | [`tests/`](tests/) |
 
 ## How it works
 
@@ -174,10 +174,13 @@ python -m dbx_fabric_security.cli extract-databricks \
 ```
 
 This writes `out/databricks-extract/extracted_views.sql` (the raw,
-reconstructed `CREATE VIEW` DDL) **and** `extracted_grants.csv` (every
-principal holding SELECT on each view, together with its resolved Azure AD
-object id, in `view,principal,principal_object_id,privilege` shape) —
-together, a durable, reviewable pair of artifacts you can hand off, commit,
+reconstructed `CREATE VIEW` DDL), `extracted_grants.csv` (every principal
+holding SELECT on each view, together with its resolved Azure AD object id,
+in `view,principal,principal_object_id,privilege` shape), and
+`extracted_table_columns.json` (each referenced base table's real column
+list, used to correctly attribute an unqualified column in a joined view to
+its actual source table — see "Column-to-table attribution" below) —
+together, a durable, reviewable set of artifacts you can hand off, commit,
 or archive — plus `view_security_definitions.json` (the structured
 extraction result). Omit `--execute` to see the request that *would* be
 made without calling Databricks at all.
@@ -197,21 +200,25 @@ credentials used:**
 python -m dbx_fabric_security.cli translate \
   --views out/databricks-extract/extracted_views.sql \
   --grants out/databricks-extract/extracted_grants.csv \
+  --table-columns out/databricks-extract/extracted_table_columns.json \
   --out-dir out/fabric-translate
 
 python -m dbx_fabric_security.cli deploy \
   --views out/databricks-extract/extracted_views.sql \
   --grants out/databricks-extract/extracted_grants.csv \
+  --table-columns out/databricks-extract/extracted_table_columns.json \
   --targets path/to/deploy_targets.json \
   --bearer-token "$FABRIC_API_TOKEN" \
   --apply \
   --out-dir out/fabric-deploy
 ```
 
-These take `extracted_views.sql` + `extracted_grants.csv` from step 1 as
-plain input — this pipeline never needs to reach Databricks itself, and the
-principal object ids it needs for Fabric role `members` payloads travel
-inside `extracted_grants.csv`, not a separate identity file. In Azure
+These take the three artifacts from step 1 as plain input — this pipeline
+never needs to reach Databricks itself, and the principal object ids it
+needs for Fabric role `members` payloads travel inside
+`extracted_grants.csv`, not a separate identity file. `--table-columns` is
+optional but recommended whenever any view joins tables — see
+"Column-to-table attribution" below. In Azure
 DevOps, this is
 [`pipelines/azure-pipelines-security-migration.yml`](pipelines/azure-pipelines-security-migration.yml),
 which consumes step 1's pipeline artifact via a `resources.pipelines`
@@ -293,6 +300,59 @@ SELECT a * b AS c FROM table1;
 
 Verified by `tests/test_view_parser.py::test_derived_column_assumption` and
 `tests/test_cls_translator.py::test_derived_column_never_gets_direct_entitlement`.
+
+## Column-to-table attribution (joins)
+
+A view built on a **single** table has no ambiguity: every column in its
+SELECT list — qualified or not — obviously belongs to that one table. A
+view that **joins** two or more tables is different: a column the SQL
+qualifies (`t1.a`) resolves directly, but a bare, unqualified column (just
+`a`) gives the parser (`sqlglot`, which does no schema-aware resolution)
+nothing to disambiguate it with — it can't tell on its own whether `a`
+came from `table1` or `table2`. Get this wrong and a CLS entitlement gets
+granted against the wrong physical table.
+
+This is fixed, not just flagged: an unqualified column in a joined view is
+resolved against each candidate table's **real column list** —
+`DatabricksApiClient.fetch_table_columns` live (`extract-databricks` runs
+this automatically, as an extra pass before the final parse), or
+`--table-columns <path/to/json>` offline (`{"catalog.schema.table":
+["col1", "col2", ...]}` — see `tests/fixtures/table_columns_sample.json`).
+This resolution is deterministic, not a best guess: Databricks/Spark SQL
+refuses to `CREATE VIEW` in the first place if an unqualified column is
+genuinely ambiguous across the joined tables, so once each table's real
+columns are known there is at most one correct answer.
+
+Without a table-columns schema supplied, a joined view's unqualified
+columns still get entitlements (nothing is silently dropped) — they just
+fall back to the view's first base table (alphabetically), **explicitly
+flagged** per column in `unsupported_constructs` rather than resolved
+silently, which is what happened before this was addressed. Worked
+example (`tests/fixtures/sample_views.sql`,
+`sec.sales.v_orders_with_region_name`):
+
+```sql
+CREATE OR REPLACE VIEW sec.sales.v_orders_with_region_name AS
+SELECT order_id, amount, region_name  -- region_name is unqualified
+FROM sec.sales.orders o
+JOIN sec.sales.regions r ON o.region = r.region_code;
+-- region_name actually lives on `regions`, not `orders`.
+```
+
+| | `column_source_tables["region_name"]` | Flagged? |
+|---|---|---|
+| No `--table-columns` supplied | `sec.sales.orders` (**wrong**) | Yes — explicit per-column warning |
+| `--table-columns tests/fixtures/table_columns_sample.json` | `sec.sales.regions` (**correct**) | No |
+
+Verified by `tests/test_view_parser.py::test_unqualified_join_column_misattribution_is_flagged_without_schema`,
+`test_unqualified_join_column_resolves_correctly_with_table_columns`, and
+`tests/test_cls_translator.py::test_join_column_attributed_to_its_real_table_when_schema_supplied`.
+
+This only affects **CLS** (which table a *column* belongs to). It does not
+extend to **RLS** for a multi-table WHERE clause — deciding which table a
+cross-table row-filter predicate should become a Fabric row filter *against*
+is a materially harder, still-open problem; see
+[`docs/limitations.md`](docs/limitations.md#complex-view-definitions-joins).
 
 ## Target resolution: tables, not views
 

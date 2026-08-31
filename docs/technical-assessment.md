@@ -33,6 +33,17 @@ pieces of information per view, which are then joined by view name:
      anywhere in the SELECT list — whether selected directly or used inside
      a derived expression — with the derived output alias itself excluded.
      `SELECT a, b, a * b AS c` yields `[a, b]`; `c` never appears.
+   - **Which physical table each flattened column actually came from**
+     (`column_source_tables`) — trivial for a single-table view, resolved
+     via the FROM/JOIN alias map when the SQL qualifies the column (`t1.a`),
+     and resolved deterministically for an unqualified column in a
+     multi-table view by matching it against each candidate table's real
+     column list (`DatabricksApiClient.fetch_table_columns`, or
+     `--table-columns` offline). This matters because two joined tables can
+     each contribute columns to the same view, and a column written without
+     a table alias gives `sqlglot` (which does no schema-aware resolution)
+     nothing to disambiguate it with on its own — see §6 for the failure
+     mode this replaced and why the fix is exact, not heuristic.
    - **FROM/JOIN clause and WHERE clause**, kept verbatim (not decomposed)
      so a flattened "reformatted" SELECT can be reconstructed for RLS.
    - Structural flags: `is_complex` (JOIN/GROUP BY/window/subquery/UNION),
@@ -128,6 +139,7 @@ reviewable report.
 | Authenticate service-principal calls | Azure AD app registration, client-credentials flow, Fabric API permission scope | Standard AAD app registration pattern; requires the target tenant's Fabric admin to enable service-principal API access before this can run non-interactively in a pipeline. |
 | Read Unity Catalog SELECT grants | Databricks Statement Execution API against `information_schema.table_privileges` | Implemented (`DatabricksApiClient.fetch_view_grants`). Standard SQL, no special API needed beyond warehouse access; requires the catalog-ownership bootstrap (§ RBAC) to see every grant, not just the caller's own. |
 | Resolve a grantee name to its Azure AD object id | Databricks workspace SCIM API (`/api/2.0/preview/scim/v2/Groups`, `/Users`) | Implemented (`DatabricksApiClient.fetch_principal_directory`). Requires the caller to have SCIM read access (typically workspace admin); unresolved names are flagged rather than dropped. |
+| Resolve which base table an unqualified joined-view column belongs to | Databricks Statement Execution API against `information_schema.columns` | Implemented (`DatabricksApiClient.fetch_table_columns`), batched one query per distinct catalog. Same access as reading grants; requires no elevated privilege beyond what the extraction identity already needs. |
 
 **Recommendation:** before any production build-out, run a short technical
 validation pass (a few hours, not a spike) against a live Fabric tenant:
@@ -145,7 +157,12 @@ final serialization step does, which is deliberately isolated in
 subcommands `extract`/`extract-databricks`/`translate`/`map-roles`/`deploy`)
 and two Azure DevOps pipelines — one Databricks-only, one Fabric-only, per
 README.md's "Running the stages separately" — chained via a pipeline
-artifact. Every deploy defaults to a dry run; `--apply` plus a bearer token
+artifact. `extract-databricks` runs a lightweight first parse pass purely
+to discover every base table referenced across all views, fetches their
+real column lists in one batched call
+(`extracted_table_columns.json`), then re-parses with that schema info so
+joined-view column attribution is resolved before anything downstream sees
+it. Every deploy defaults to a dry run; `--apply` plus a bearer token
 are both required to make a live call, and the deploy step is a
 full-replace `PUT` that first reads existing roles and preserves any role
 not owned by this toolkit's naming convention (`role_<table>_<principal>`),
@@ -169,7 +186,8 @@ to match its name.
 | Fabric Data Access Roles API schema changes during/after preview | Schema is isolated to `role_builder.py` / `fabric_api/client.py`; extraction and entitlement modeling are API-agnostic and don't need to change. |
 | A principal's Azure AD object id can't be resolved via SCIM (extraction identity lacks SCIM read access, or the principal is neither a Databricks group nor user) | Reported as `unresolvedPrincipalObjectId` in role/mapping output; role is still generated but deploy should be blocked on this until resolved (see pipeline's Validate stage). |
 | Extraction identity can't see the *complete* grantee list on a view (only `SELECT`, not ownership/`MANAGE`/admin) | `information_schema.table_privileges` silently omits grants the caller isn't entitled to see rather than erroring — mitigated by the one-time `grant-catalog-access` bootstrap step making the extraction identity a catalog owner (see README RBAC section). |
-| Nested/complex views produce an incomplete flattened column list or an incomplete row filter | Detected and flagged for manual review rather than translated with false confidence (see Limitations). |
+| An unqualified column in a joined view gets attributed to the wrong physical table, granting CLS on the wrong table's column | Was a real, previously-unflagged risk: `sqlglot` cannot resolve an unqualified reference across joined tables on its own, and the original design attributed every column in a view to one table (`base_tables[0]`) regardless of which table it actually came from. Fixed by resolving each column's real source table via the FROM/JOIN alias map (qualified columns) or each candidate table's live column list (`fetch_table_columns`/`--table-columns`, unqualified columns) -- deterministic, not a guess, because Spark SQL refuses to `CREATE VIEW` in the first place over a genuinely ambiguous unqualified reference. Without a table-columns schema supplied, still falls back to `base_tables[0]`, but now says so explicitly per column rather than silently. |
+| Nested/complex views produce an incomplete row filter (RLS only -- CLS column attribution is solved, see risk above) | Detected and flagged for manual review rather than translated with false confidence (see Limitations). |
 | Automated deploy overwrites a manually-created Fabric role | Deploy only manages roles matching its own naming convention and preserves everything else; full plan is diffed and reported before apply. |
 | A schema-level default target accidentally matches a nested view's base-view name (not a real table), deploying a role against a Fabric table that doesn't exist | Roles whose `table` is a known view name are filtered out before target resolution runs, unconditionally -- a schema default can never catch them by accident. Reported separately from genuinely unmapped tables (`cli.cmd_deploy`). |
 | A view's WHERE clause references a column not exposed in the SELECT list | The WHERE clause is reproduced verbatim regardless — Fabric's row filter, like the original Databricks view, can filter on a column it doesn't return. No special handling needed. |

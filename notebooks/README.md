@@ -22,7 +22,7 @@ setting up a pipeline identity first.
 
 ## What it produces
 
-Same two artifacts as `dbx_fabric_security.cli extract-databricks`:
+Same artifacts as `dbx_fabric_security.cli extract-databricks`:
 
 - `extracted_views.sql` -- reconstructed `CREATE VIEW` DDL for every view in
   scope.
@@ -30,11 +30,19 @@ Same two artifacts as `dbx_fabric_security.cli extract-databricks`:
   one row per SELECT grant. The last cell in step 4 also prints this CSV's
   contents directly into the notebook output, so you can copy it straight
   into a file without downloading from DBFS if that's easier.
+- `extracted_table_columns.json` -- each base table's real column list
+  (step 5b), used to correctly attribute an unqualified column in a
+  *joined* view to its actual source table instead of guessing. Only
+  matters if you have views that join tables and reference a column
+  without a table alias (e.g. `SELECT region_name FROM orders o JOIN
+  regions r ON ...` where `region_name` actually lives on `regions`) --
+  see the main README's "Column-to-table attribution". Requires the
+  toolkit import in step 5a.
 
-Step 5 optionally also produces `view_security_definitions.json` (the
+Steps 5a-5c optionally also produce `view_security_definitions.json` (the
 structured extraction result), if this repo's `src/` is importable from the
-notebook (e.g. checked out as a Databricks Repo) -- otherwise skip it and
-run `dbx_fabric_security.cli translate` on the two CSV/SQL artifacts from
+notebook (e.g. checked out as a Databricks Repo) -- otherwise skip them and
+run `dbx_fabric_security.cli translate` on the CSV/SQL/JSON artifacts from
 wherever you copy them to.
 
 ## The one thing to watch for

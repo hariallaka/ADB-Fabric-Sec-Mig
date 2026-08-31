@@ -34,7 +34,7 @@ import sys
 
 from dbx_fabric_security.extractor.databricks_client import DatabricksApiClient
 from dbx_fabric_security.extractor.grants import parse_grants_csv
-from dbx_fabric_security.extractor.view_parser import parse_views_file
+from dbx_fabric_security.extractor.view_parser import distinct_base_tables, parse_views_file
 from dbx_fabric_security.fabric_api.client import FabricApiClient
 from dbx_fabric_security.fabric_api.deploy import deploy_roles, resolve_table_target
 from dbx_fabric_security.mapping.role_mapper import build_role_mapping
@@ -72,9 +72,23 @@ def _write_grants_csv(path: str, grants_by_view: dict[str, list[str]], principal
                 writer.writerow([view, principal, principal_directory.get(principal, ""), "SELECT"])
 
 
-def _run_extraction(views_path: str, grants_path: str | None) -> tuple[list, dict[str, str]]:
+def _load_table_columns(path: str | None) -> dict[str, list[str]] | None:
+    """Returns ``None`` (not ``{}``) when no path is given -- the parser
+    distinguishes "no schema info supplied at all" from "supplied but this
+    particular table wasn't in it", flagging each differently.
+    """
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _run_extraction(
+    views_path: str, grants_path: str | None, table_columns_path: str | None = None
+) -> tuple[list, dict[str, str]]:
     grants_by_view, principal_directory = parse_grants_csv(grants_path) if grants_path else ({}, {})
-    views = parse_views_file(views_path, grants_by_view=grants_by_view)
+    table_columns = _load_table_columns(table_columns_path)
+    views = parse_views_file(views_path, grants_by_view=grants_by_view, table_columns=table_columns)
     return views, principal_directory
 
 
@@ -83,7 +97,7 @@ def _run_translation(views: list) -> tuple[list, list]:
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
-    views, _ = _run_extraction(args.views, args.grants)
+    views, _ = _run_extraction(args.views, args.grants, args.table_columns)
     os.makedirs(args.out_dir, exist_ok=True)
     payload = [dataclasses.asdict(v) for v in views]
     _write_json(os.path.join(args.out_dir, "view_security_definitions.json"), payload)
@@ -139,10 +153,25 @@ def cmd_extract_databricks(args: argparse.Namespace) -> None:
         print(f"  {len(unresolved)} principal(s) could not be resolved to an Azure AD object id "
               f"via SCIM (not found as a Databricks group or user): {unresolved}")
 
-    # Reuse the exact same parsing path as the file-based `extract` command so
-    # downstream translate/map-roles/deploy behave identically regardless of
-    # whether extraction ran against a live workspace or a static SQL file.
-    views = parse_views_file(sql_path, grants_by_view=grants_by_view)
+    # First pass (no table_columns yet): just to discover every base table
+    # referenced, across every view, so their real column lists can be
+    # fetched before resolving column-to-table attribution for any
+    # multi-table (joined) view -- see view_parser._resolve_select_columns.
+    provisional_views = parse_views_file(sql_path, grants_by_view=grants_by_view)
+    all_base_tables = distinct_base_tables(provisional_views)
+    table_columns = (
+        client.fetch_table_columns(args.warehouse_id, all_base_tables) if all_base_tables else {}
+    )
+    table_columns_path = os.path.join(args.out_dir, "extracted_table_columns.json")
+    _write_json(table_columns_path, table_columns)
+    print(f"Fetched columns for {len(table_columns)}/{len(all_base_tables)} base table(s) "
+          f"-> {table_columns_path}")
+
+    # Second pass, now with schema info: reuse the exact same parsing path
+    # as the file-based `extract` command so downstream translate/map-roles/
+    # deploy behave identically regardless of whether extraction ran
+    # against a live workspace or a static SQL file + --table-columns.
+    views = parse_views_file(sql_path, grants_by_view=grants_by_view, table_columns=table_columns)
     payload = [dataclasses.asdict(v) for v in views]
     _write_json(os.path.join(args.out_dir, "view_security_definitions.json"), payload)
     ungranted = [v.fq_name for v in views if not v.grantees]
@@ -175,7 +204,7 @@ def cmd_grant_catalog_access(args: argparse.Namespace) -> None:
 
 
 def cmd_translate(args: argparse.Namespace) -> None:
-    views, principal_dir = _run_extraction(args.views, args.grants)
+    views, principal_dir = _run_extraction(args.views, args.grants, args.table_columns)
     cls_entitlements, rls_entitlements = _run_translation(views)
 
     fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, principal_dir)
@@ -192,7 +221,7 @@ def cmd_translate(args: argparse.Namespace) -> None:
 
 
 def cmd_map_roles(args: argparse.Namespace) -> None:
-    views, principal_dir = _run_extraction(args.views, args.grants)
+    views, principal_dir = _run_extraction(args.views, args.grants, args.table_columns)
     cls_entitlements, rls_entitlements = _run_translation(views)
     fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, principal_dir)
     mapping_rows = build_role_mapping(fabric_roles)
@@ -209,7 +238,7 @@ def cmd_map_roles(args: argparse.Namespace) -> None:
 
 
 def cmd_deploy(args: argparse.Namespace) -> None:
-    views, principal_dir = _run_extraction(args.views, args.grants)
+    views, principal_dir = _run_extraction(args.views, args.grants, args.table_columns)
     cls_entitlements, rls_entitlements = _run_translation(views)
     fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, principal_dir)
 
@@ -278,6 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--views", required=True, help="Path to a .sql file containing CREATE VIEW statements")
         p.add_argument("--grants", help="Path to a grants CSV (view,principal,principal_object_id,privilege) -- who holds SELECT on each view")
+        p.add_argument("--table-columns", help="Path to a JSON file {catalog.schema.table: [col1, col2, ...]} used to resolve an unqualified column in a multi-table (joined) view to its correct source table")
         p.add_argument("--out-dir", default="out", help="Directory to write output artifacts to")
 
     p_extract = sub.add_parser("extract", help="Parse a local view SQL file into structured security definitions")

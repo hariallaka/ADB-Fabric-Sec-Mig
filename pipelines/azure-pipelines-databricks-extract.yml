@@ -70,11 +70,15 @@ stages:
                 --token "$(DATABRICKS_TOKEN)" \
                 --execute \
                 --out-dir "$(outDir)"
-            displayName: "Pull view DDL + SELECT grants from Unity Catalog and extract"
-          # Publishes the raw extracted DDL (extracted_views.sql) and the
-          # actual SELECT grantees per view (extracted_grants.csv) --
-          # together, the Fabric-side pipeline's `--views`/`--grants` input
-          # -- plus the structured JSON, useful on its own for a
-          # Databricks-side security review, independent of Fabric.
+            displayName: "Pull view DDL + SELECT grants + table columns from Unity Catalog and extract"
+          # Publishes the raw extracted DDL (extracted_views.sql), the
+          # actual SELECT grantees per view (extracted_grants.csv), and
+          # each referenced base table's real column list
+          # (extracted_table_columns.json, used to correctly attribute an
+          # unqualified column in a joined view to its real source table)
+          # -- together, the Fabric-side pipeline's `--views`/`--grants`/
+          # `--table-columns` input -- plus the structured JSON, useful on
+          # its own for a Databricks-side security review, independent of
+          # Fabric.
           - publish: "$(outDir)"
             artifact: extracted-views

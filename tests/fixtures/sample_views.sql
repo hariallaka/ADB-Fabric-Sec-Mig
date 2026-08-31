@@ -66,3 +66,16 @@ CREATE OR REPLACE VIEW sec.finance.v_my_expense_reports AS
 SELECT report_id, submitted_by, amount
 FROM sec.finance.expense_reports
 WHERE submitted_by = current_user();
+
+-- 8. Join with an UNQUALIFIED column reference -- the exact ambiguity
+--    column-to-table attribution has to resolve correctly: `region_name`
+--    lives only on `regions`, not `orders`, but is written bare (no `r.`
+--    qualifier) in the SELECT list. Without a table-columns schema this
+--    would previously be silently misattributed to the alphabetically
+--    first base table (`sec.sales.orders`, wrong); with one supplied it
+--    resolves to the correct table, and without one it's now explicitly
+--    flagged rather than guessed at silently.
+CREATE OR REPLACE VIEW sec.sales.v_orders_with_region_name AS
+SELECT order_id, amount, region_name
+FROM sec.sales.orders o
+JOIN sec.sales.regions r ON o.region = r.region_code;
