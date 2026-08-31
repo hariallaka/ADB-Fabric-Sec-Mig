@@ -9,7 +9,7 @@ GRANTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "grants_sam
 
 
 def _view(name):
-    grants = parse_grants_csv(GRANTS_FIXTURE)
+    grants, _principal_dir = parse_grants_csv(GRANTS_FIXTURE)
     views = parse_views_file(FIXTURE, grants_by_view=grants)
     return [v for v in views if v.fq_name == name][0]
 
@@ -22,7 +22,7 @@ def test_no_where_clause_yields_unrestricted_filter():
 
 
 def test_and_predicate_carried_through_verbatim():
-    grants = parse_grants_csv(GRANTS_FIXTURE)
+    grants, _principal_dir = parse_grants_csv(GRANTS_FIXTURE)
     views = parse_views_file(FIXTURE, grants_by_view=grants)
     v = [x for x in views if x.fq_name == "sec.hr.v_employee_basic"][0]
     entitlements = translate_rls([v])

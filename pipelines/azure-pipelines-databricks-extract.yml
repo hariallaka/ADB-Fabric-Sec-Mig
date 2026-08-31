@@ -15,6 +15,15 @@
 # merged pipeline); nothing in the toolkit itself needs to change for that
 # consolidation, only which identity the pipeline runs as.
 #
+# Prerequisite (one-time, run by a catalog owner/admin -- NOT by this
+# pipeline's own identity, which doesn't have the privilege yet): the
+# DATABRICKS_TOKEN identity below must be able to see every view's
+# definition and every principal's grants in DATABRICKS_CATALOG, which
+# requires ownership/MANAGE/admin on the catalog, not just SELECT on each
+# view. Run once via `dbx_fabric_security.cli grant-catalog-access` (see
+# README "RBAC / permissions required") before the first run of this
+# pipeline.
+#
 # Required pipeline variables / variable group ("dbx-fabric-security-migration"):
 #   DATABRICKS_TOKEN          - PAT or AAD service-principal token, scoped
 #                                per README "Databricks RBAC" (store as secret)
@@ -22,6 +31,11 @@
 #   DATABRICKS_WAREHOUSE_ID   - SQL warehouse used to run the extraction query
 #   DATABRICKS_CATALOG        - Unity Catalog catalog to scan
 #   DATABRICKS_SCHEMA         - optional: restrict to one schema
+#
+# extract-databricks also resolves each grantee's Azure AD object id via the
+# workspace SCIM API, which requires DATABRICKS_TOKEN's identity to have
+# SCIM read access (typically workspace admin) -- see README for the same
+# caveat if object ids come back unresolved.
 
 trigger: none # run on-demand or on a schedule; extraction should not block on every commit
 

@@ -27,6 +27,24 @@ production scope to this approach, run `SHOW ROW FILTERS`/`SHOW COLUMN
 MASKS` against a representative sample of target catalogs** to confirm this
 gap doesn't affect the tables in scope.
 
+## Extraction identity must be able to see every grant, not just its own
+
+**Status: understood and mitigated via a one-time bootstrap step, not a
+code limitation.** `information_schema.table_privileges` only surfaces the
+grants the querying identity is entitled to see: broadly, privileges it
+holds or granted itself, or *every* privilege if it owns the object, holds
+`MANAGE` on it, or is a metastore/account admin. An extraction identity
+with only `SELECT` on a view will see that view's own definition but will
+**silently** miss other principals' grants on it -- no error, just an
+incomplete `extracted_grants.csv`. This toolkit ships a fix
+(`dbx_fabric_security.cli grant-catalog-access`, run once by an existing
+catalog owner/admin to make the extraction identity a catalog owner or
+grant it `ALL PRIVILEGES`), but it's worth calling out explicitly here: a
+pipeline running under an under-provisioned identity won't fail loudly, it
+will just under-report access, which is a worse failure mode than an error.
+Cross-check `extracted_grants.csv`'s row counts against expectations after
+the first live run.
+
 ## Derived columns
 
 **Status: handled per the spike's key design assumption, validated by
@@ -105,10 +123,12 @@ dropped.
   before parsing.
 - **Individual-user grants** — Unity Catalog allows granting SELECT
   directly to a user, not just a group. This toolkit treats every principal
-  uniformly; a user-level grant produces a Fabric role scoped to that one
-  user, and — since only groups are tracked in the AGS export — comes back
-  `unresolvedPrincipalObjectId: true` and is flagged for manual resolution
-  rather than silently dropped or silently deployed with a guessed group.
+  uniformly and does attempt to resolve a user's object id via SCIM (see
+  `DatabricksApiClient.fetch_principal_object_id`, which checks Groups then
+  Users) the same way it resolves a group's; if that lookup can't find a
+  match (or the extraction identity lacks SCIM read access), the grant
+  comes back `unresolvedPrincipalObjectId: true` and is flagged for manual
+  resolution rather than silently dropped or deployed with a guessed id.
 - **Table-level grants (no view involved)** — this spike's scope was
   specifically Unity Catalog views; classic `GRANT SELECT ON TABLE ... TO
   group` statements with no view in between are a separate, simpler
@@ -122,6 +142,7 @@ dropped.
 | Scenario | Extraction | Translation | Recommended production follow-up |
 |---|---|---|---|
 | Native UC row filters / column masks (`ALTER TABLE ... SET ROW FILTER/MASK`) | **Not covered** | N/A | Confirm the real estate's tables don't rely on these before finalizing scope |
+| Extraction identity under-provisioned (only SELECT, not ownership/MANAGE/admin) | Silently incomplete grant list | N/A | Run `grant-catalog-access` once per catalog before first use; cross-check row counts |
 | Derived columns | Full | Full (per assumption) | Extend to trace through nested views |
 | Simple SELECT-grant CLS | Full | Full | — |
 | WHERE clause with AND | Full (verbatim) | Full (verbatim) | — |
@@ -129,5 +150,5 @@ dropped.
 | Nested views | Detected | Grants/filters not composed | Add topological resolution pass |
 | Complex views (join/agg/window/union) | Best-effort, flagged | Best-effort, keyed to first base table | Manual review per flagged view |
 | `SELECT *` views | Flagged, skipped | N/A | Resolve schema out of band before parsing |
-| Individual-user grants | Full | Full, flagged unresolved if not in AGS | Decide production posture for non-group grants |
+| Individual-user grants | Full | Full, flagged unresolved if SCIM can't match | Decide production posture for non-group grants |
 | Non-view UC table grants | Not in scope | N/A | Separate, simpler translation path |

@@ -9,7 +9,7 @@ GRANTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "grants_sam
 
 
 def _views():
-    grants = parse_grants_csv(GRANTS_FIXTURE)
+    grants, _principal_dir = parse_grants_csv(GRANTS_FIXTURE)
     return parse_views_file(FIXTURE, grants_by_view=grants)
 
 

@@ -7,13 +7,12 @@ pip install -e .
 python -m dbx_fabric_security.cli run-all \
   --views tests/fixtures/sample_views.sql \
   --grants tests/fixtures/grants_sample.csv \
-  --ags-export tests/fixtures/ags_export_sample.csv \
   --targets tests/fixtures/deploy_targets_sample.json \
   --out-dir out/demo
 pytest tests/ -v
 ```
 
-## Test suite: 28/28 passing
+## Test suite: 37/37 passing
 
 ```
 tests/test_cls_translator.py::test_derived_column_never_gets_direct_entitlement PASSED
@@ -23,6 +22,14 @@ tests/test_databricks_client.py::test_dry_run_never_calls_network_and_returns_em
 tests/test_databricks_client.py::test_fetch_view_ddl_dry_run_returns_empty_mapping PASSED
 tests/test_databricks_client.py::test_fetch_view_grants_dry_run_returns_empty_mapping PASSED
 tests/test_databricks_client.py::test_grants_reconstruction_shape PASSED
+tests/test_databricks_client.py::test_fetch_principal_object_id_dry_run_returns_unknown PASSED
+tests/test_databricks_client.py::test_fetch_principal_directory_dry_run_returns_empty PASSED
+tests/test_databricks_client.py::test_fetch_principal_object_id_resolves_group_before_user PASSED
+tests/test_databricks_client.py::test_fetch_principal_object_id_falls_back_to_user PASSED
+tests/test_databricks_client.py::test_fetch_principal_directory_dedupes_and_skips_unresolved PASSED
+tests/test_databricks_client.py::test_grant_catalog_access_owner_mode_dry_run PASSED
+tests/test_databricks_client.py::test_grant_catalog_access_all_privileges_mode_dry_run PASSED
+tests/test_databricks_client.py::test_grant_catalog_access_rejects_bad_mode PASSED
 tests/test_databricks_client.py::test_missing_token_raises_on_live_call PASSED
 tests/test_databricks_client.py::test_ddl_reconstruction_shape PASSED
 tests/test_deploy.py::test_dry_run_never_calls_network_and_reports_plan PASSED
@@ -35,7 +42,8 @@ tests/test_rls_translator.py::test_view_with_no_grantees_produces_no_entitlement
 tests/test_role_builder_and_mapping.py::test_role_builder_merges_cls_and_rls_per_table_and_principal PASSED
 tests/test_role_builder_and_mapping.py::test_or_predicate_role_carries_full_predicate PASSED
 tests/test_role_builder_and_mapping.py::test_role_builder_flags_unresolved_principal PASSED
-tests/test_role_builder_and_mapping.py::test_role_mapping_ties_ags_to_fabric_role PASSED
+tests/test_role_builder_and_mapping.py::test_grants_csv_principal_without_object_id_is_unresolved PASSED
+tests/test_role_builder_and_mapping.py::test_role_mapping_flattens_roles_with_no_ags_involved PASSED
 tests/test_view_parser.py::test_derived_column_assumption PASSED
 tests/test_view_parser.py::test_grants_are_read_not_inferred_from_sql PASSED
 tests/test_view_parser.py::test_and_where_clause_preserved_verbatim PASSED
@@ -45,7 +53,7 @@ tests/test_view_parser.py::test_nested_view_flagged PASSED
 tests/test_view_parser.py::test_complex_view_flagged_but_still_flattened PASSED
 tests/test_view_parser.py::test_reformatted_select_sql_matches_spike_example PASSED
 
-28 passed in 0.31s
+37 passed in 0.40s
 ```
 
 ## AC1 — CLS feasibility: evidence
@@ -58,12 +66,12 @@ CREATE OR REPLACE VIEW sec.finance.v_derived_example AS
 SELECT a, b, a * b AS c FROM sec.finance.table1;
 ```
 
-`grants_sample.csv` grants `finance_readers` SELECT on this view. Result:
+`grants_sample.csv` grants `finance_readers` SELECT on this view, with
+object id `7c3a4e10-1111-4a2b-9c1d-000000000001`. Result:
 `select_columns == ["a", "b"]`, `derived_output_columns == ["c"]`; CLS
-entitlements generated for `a` and `b` for `finance_readers`; **zero**
-entitlements generated for `c`. Enforced by
-`tests/test_view_parser.py::test_derived_column_assumption` and
-`tests/test_cls_translator.py::test_derived_column_never_gets_direct_entitlement`.
+entitlements generated for `a` and `b`; **zero** entitlements generated for
+`c`. Enforced by `tests/test_view_parser.py::test_derived_column_assumption`
+and `tests/test_cls_translator.py::test_derived_column_never_gets_direct_entitlement`.
 
 Extracted + translated output (`out/demo/cls_entitlements.json`, filtered):
 
@@ -133,10 +141,14 @@ Enforced by `tests/test_view_parser.py::test_or_where_clause_preserved_verbatim`
 `test_nested_and_or_where_clause_preserved`, and
 `tests/test_rls_translator.py::test_or_predicate_carried_through_verbatim_for_every_grantee`.
 
-## AC3/AC4 — Fabric role generation + automated deployment feasibility
+## AC3/AC4 — Fabric role generation, principal object ids, and automated deployment feasibility
 
 Merged Fabric Data Access Role payload for `sec.finance.table1` /
-`finance_readers` (`out/demo/fabric_data_access_roles.json`, one entry):
+`finance_readers` (`out/demo/fabric_data_access_roles.json`, one entry) —
+note the object id came from `grants_sample.csv`'s `principal_object_id`
+column, the same field `extract-databricks` populates via a live SCIM
+lookup; no AGS or other external identity export is involved anywhere in
+this pipeline:
 
 ```json
 {
@@ -158,19 +170,26 @@ Merged Fabric Data Access Role payload for `sec.finance.table1` /
 }
 ```
 
-AGS → AD Group → Fabric Role mapping (`out/demo/ags_role_mapping.csv`, 8
-rows generated from 7 fixture views):
+**Unresolved-principal handling, also demonstrated:** the fixture grants
+`hr_contractor` SELECT on `sec.hr.v_employee_basic` with a deliberately
+blank `principal_object_id`. The resulting role comes back
+`unresolvedPrincipalObjectId: true`, flagged rather than silently deployed
+or dropped:
 
 ```
-agsId,adGroupName,fabricRoleName,oneLakeObject,oneLakePath,columnPermitCount,rowFilters
-AGS-1001,finance_readers,role_sec_finance_expense_reports_finance_readers,sec.finance.expense_reports,Tables/expense_reports,3,["submitted_by = CURRENT_USER()"]
-AGS-1001,finance_readers,role_sec_finance_table1_finance_readers,sec.finance.table1,Tables/table1,2,["TRUE"]
-AGS-1002,hr_readers,role_sec_hr_employee_hr_readers,sec.hr.employee,Tables/employee,3,["dept = 'Engineering' AND active = TRUE"]
-AGS-1006,export_team,role_sec_hr_v_employee_basic_export_team,sec.hr.v_employee_basic,Tables/v_employee_basic,2,["dept = 'Engineering'"]
-AGS-1005,sales_finance,role_sec_sales_order_lines_sales_finance,sec.sales.order_lines,Tables/order_lines,4,["(region = 'US' AND status = 'ACTIVE') OR priority = 'HIGH'"]
-AGS-1007,sales_admin,role_sec_sales_orders_sales_admin,sec.sales.orders,Tables/orders,2,["o.active = TRUE"]
-AGS-1004,sales_region_eu,role_sec_sales_orders_sales_region_eu,sec.sales.orders,Tables/orders,4,["region = 'US' OR region = 'CA'"]
-AGS-1003,sales_region_us,role_sec_sales_orders_sales_region_us,sec.sales.orders,Tables/orders,4,["region = 'US' OR region = 'CA'"]
+Role mapping rows: 9 -> out/demo/role_mapping.csv
+  WARNING: 1 principal(s) have no known object id (not in --grants'
+  principal_object_id column): ['hr_contractor']
+```
+
+AD Group/principal → Fabric Role mapping (`out/demo/role_mapping.csv`, 9
+rows generated from 7 fixture views; excerpt below):
+
+```
+principalName,principalObjectId,fabricRoleName,oneLakeObject,columnPermitCount,rowFilters
+finance_readers,7c3a4e10-1111-...-000000000001,role_sec_finance_table1_finance_readers,sec.finance.table1,2,["TRUE"]
+sales_region_us,7c3a4e10-3333-...-000000000003,role_sec_sales_orders_sales_region_us,sec.sales.orders,4,["region = 'US' OR region = 'CA'"]
+hr_contractor,,role_sec_hr_employee_hr_contractor,sec.hr.employee,3,["dept = 'Engineering' AND active = TRUE"]
 ```
 
 **Automated deployment feasibility:** `cli deploy` (dry-run by default)
@@ -215,5 +234,5 @@ deployment on manual sign-off for exactly these views, per
 |---|---|
 | CLS extraction feasibility | §AC1 above, `tests/test_view_parser.py`, `tests/test_cls_translator.py` |
 | RLS extraction feasibility, including OR edge cases | §AC2 above, `tests/test_view_parser.py`, `tests/test_rls_translator.py` |
-| Fabric role creation feasibility | §AC3/AC4 above, `tests/test_role_builder_and_mapping.py` |
+| Fabric role creation + principal object id resolution feasibility | §AC3/AC4 above, `tests/test_role_builder_and_mapping.py`, `tests/test_databricks_client.py` |
 | Automated deployment feasibility | §AC3/AC4 above, `tests/test_deploy.py`, `fabric_api/deploy.py` |

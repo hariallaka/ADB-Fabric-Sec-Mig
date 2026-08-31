@@ -22,10 +22,11 @@
 #   DATABRICKS_VIEWS_PATH     - only used when extractSource=localFile: path (in
 #                                this repo or an artifact drop) to exported view DDL
 #   DATABRICKS_GRANTS_PATH    - only used when extractSource=localFile: path to a
-#                                grants CSV (view,principal,privilege) -- who holds
-#                                SELECT on each view; this is the sole source of
-#                                CLS/RLS access, never inferred from view SQL
-#   AGS_EXPORT_PATH           - path to the latest AGS group export CSV
+#                                grants CSV (view,principal,principal_object_id,
+#                                privilege) -- who holds SELECT on each view, and
+#                                their Azure AD object id; this is the sole source
+#                                of CLS/RLS access, never inferred from view SQL
+#                                or from any AD-Group-Sync (AGS) export
 #   FABRIC_DEPLOY_TARGETS     - path to the table -> {workspaceId, itemId} map
 #
 # The Deploy stage only runs against the `--apply` flag after an environment
@@ -108,16 +109,14 @@ stages:
               python -m dbx_fabric_security.cli translate \
                 --views "$(viewsPath)" \
                 --grants "$(grantsPath)" \
-                --ags-export "$(AGS_EXPORT_PATH)" \
                 --out-dir "$(outDir)"
             displayName: "Run translation"
           - script: |
               python -m dbx_fabric_security.cli map-roles \
                 --views "$(viewsPath)" \
                 --grants "$(grantsPath)" \
-                --ags-export "$(AGS_EXPORT_PATH)" \
                 --out-dir "$(outDir)"
-            displayName: "Build AGS -> AD Group -> Fabric Role mapping"
+            displayName: "Build AD Group/principal -> Fabric Role mapping"
           - publish: "$(outDir)"
             artifact: translated-security-model
 
@@ -146,11 +145,12 @@ stages:
               roles = json.load(open(path))
               unresolved = [r["name"] for r in roles if r.get("unresolvedPrincipalObjectId")]
               if unresolved:
-                  print(f"::warning::{len(unresolved)} role(s) reference a principal missing from "
-                        f"the AGS export and cannot be deployed as-is: {unresolved}")
+                  print(f"::warning::{len(unresolved)} role(s) reference a principal with no known "
+                        f"Azure AD object id (missing from the grants CSV's principal_object_id "
+                        f"column) and cannot be deployed as-is: {unresolved}")
               print(f"Validated {len(roles)} Fabric role definition(s).")
               PY
-            displayName: "Flag unresolved AD group mappings"
+            displayName: "Flag unresolved principal object ids"
 
   - stage: DeployApproval
     displayName: "Manual approval gate"
@@ -185,7 +185,6 @@ stages:
               python -m dbx_fabric_security.cli deploy \
                 --views "$(viewsPath)" \
                 --grants "$(grantsPath)" \
-                --ags-export "$(AGS_EXPORT_PATH)" \
                 --targets "$(FABRIC_DEPLOY_TARGETS)" \
                 --bearer-token "$(FABRIC_API_TOKEN)" \
                 --apply \

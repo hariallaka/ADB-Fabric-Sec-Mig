@@ -13,7 +13,7 @@ GRANTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "grants_sam
 
 
 def _roles():
-    grants = parse_grants_csv(GRANTS_FIXTURE)
+    grants, _principal_dir = parse_grants_csv(GRANTS_FIXTURE)
     views = parse_views_file(VIEWS_FIXTURE, grants_by_view=grants)
     return build_fabric_roles(translate_cls(views), translate_rls(views))
 

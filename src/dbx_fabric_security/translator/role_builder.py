@@ -28,7 +28,8 @@ def build_fabric_roles(
 ) -> list[dict]:
     """Returns a list of Fabric data-access-role payloads keyed by
     ``(table, principal)``. ``principal_directory`` maps a principal name
-    (AD group or user) to its Entra object id, typically from an AGS export.
+    (AD group or user) to its Entra object id -- resolved via Databricks
+    SCIM at extraction time, or supplied directly in an offline grants CSV.
     """
 
     principal_directory = principal_directory or {}

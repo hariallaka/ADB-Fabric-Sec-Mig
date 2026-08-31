@@ -3,19 +3,24 @@ toolkit.
 
     python -m dbx_fabric_security.cli run-all \\
         --views tests/fixtures/sample_views.sql \\
-        --ags-export tests/fixtures/ags_export_sample.csv \\
+        --grants tests/fixtures/grants_sample.csv \\
         --out-dir out/
 
 Subcommands:
-    extract             Parse a local view SQL file -> per-view security definition JSON.
-    extract-databricks  Pull view DDL live from Unity Catalog, then extract (see
-                         README "Running the stages separately" -- this is the
-                         Databricks-side step, runnable independently of Fabric).
-    translate           Extract + translate -> CLS/RLS entitlement + Fabric role JSON.
-    map-roles           Translate + AGS export -> AGS/AD Group/Fabric Role mapping CSV.
-    deploy              Translate + a target map -> apply (or dry-run) Fabric roles.
-    run-all             Runs extract -> translate -> map-roles -> deploy(dry-run) and
-                        writes every artifact to --out-dir (local-file source only).
+    extract               Parse a local view SQL file -> per-view security definition JSON.
+    extract-databricks    Pull view DDL + SELECT grants + principal object ids live from
+                           Unity Catalog, then extract (see README "Running the stages
+                           separately" -- this is the Databricks-side step, runnable
+                           independently of Fabric).
+    grant-catalog-access  One-time bootstrap, run by a catalog owner/admin (not the
+                           extraction identity): makes the extraction service principal
+                           able to see every view's definition and every grant in a
+                           catalog. See README "RBAC / permissions required".
+    translate              Extract + translate -> CLS/RLS entitlement + Fabric role JSON.
+    map-roles               Extract + translate -> AD Group/Fabric Role mapping report.
+    deploy                 Translate + a target map -> apply (or dry-run) Fabric roles.
+    run-all                 Runs extract -> translate -> map-roles -> deploy(dry-run) and
+                            writes every artifact to --out-dir (local-file source only).
 """
 
 from __future__ import annotations
@@ -32,11 +37,7 @@ from dbx_fabric_security.extractor.grants import parse_grants_csv
 from dbx_fabric_security.extractor.view_parser import parse_views_file
 from dbx_fabric_security.fabric_api.client import FabricApiClient
 from dbx_fabric_security.fabric_api.deploy import deploy_roles
-from dbx_fabric_security.mapping.role_mapper import (
-    build_role_mapping,
-    group_directory,
-    load_ags_export,
-)
+from dbx_fabric_security.mapping.role_mapper import build_role_mapping
 from dbx_fabric_security.translator.cls_translator import translate_cls
 from dbx_fabric_security.translator.rls_translator import translate_rls
 from dbx_fabric_security.translator.role_builder import build_fabric_roles
@@ -62,28 +63,27 @@ def _write_csv(path: str, rows: list[dict]) -> None:
             )
 
 
-def _write_grants_csv(path: str, grants_by_view: dict[str, list[str]]) -> None:
+def _write_grants_csv(path: str, grants_by_view: dict[str, list[str]], principal_directory: dict[str, str]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["view", "principal", "privilege"])
+        writer.writerow(["view", "principal", "principal_object_id", "privilege"])
         for view, principals in grants_by_view.items():
             for principal in principals:
-                writer.writerow([view, principal, "SELECT"])
+                writer.writerow([view, principal, principal_directory.get(principal, ""), "SELECT"])
 
 
-def _run_extraction(views_path: str, grants_path: str | None) -> list:
-    grants_by_view = parse_grants_csv(grants_path) if grants_path else {}
-    return parse_views_file(views_path, grants_by_view=grants_by_view)
+def _run_extraction(views_path: str, grants_path: str | None) -> tuple[list, dict[str, str]]:
+    grants_by_view, principal_directory = parse_grants_csv(grants_path) if grants_path else ({}, {})
+    views = parse_views_file(views_path, grants_by_view=grants_by_view)
+    return views, principal_directory
 
 
-def _run_translation(views: list) -> tuple[list, list, list]:
-    cls_entitlements = translate_cls(views)
-    rls_entitlements = translate_rls(views)
-    return cls_entitlements, rls_entitlements, views
+def _run_translation(views: list) -> tuple[list, list]:
+    return translate_cls(views), translate_rls(views)
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
-    views = _run_extraction(args.views, args.grants)
+    views, _ = _run_extraction(args.views, args.grants)
     os.makedirs(args.out_dir, exist_ok=True)
     payload = [dataclasses.asdict(v) for v in views]
     _write_json(os.path.join(args.out_dir, "view_security_definitions.json"), payload)
@@ -119,17 +119,25 @@ def cmd_extract_databricks(args: argparse.Namespace) -> None:
     if not args.execute:
         print(
             "DRY-RUN: no Databricks call was made (pass --execute with a valid "
-            "--token to fetch live view DDL + grants). Nothing written."
+            "--token to fetch live view DDL + grants + principal object ids). Nothing written."
         )
         return
+
+    all_principals = sorted({p for principals in grants_by_view.values() for p in principals})
+    principal_directory = client.fetch_principal_directory(all_principals)
+    unresolved = [p for p in all_principals if p not in principal_directory]
 
     with open(sql_path, "w", encoding="utf-8") as fh:
         for ddl in ddl_by_view.values():
             fh.write(ddl.rstrip().rstrip(";") + ";\n\n")
-    _write_grants_csv(grants_path, grants_by_view)
+    _write_grants_csv(grants_path, grants_by_view, principal_directory)
 
-    print(f"Fetched {len(ddl_by_view)} view definition(s) and grants for "
-          f"{len(grants_by_view)} view(s) from {args.catalog} -> {sql_path}, {grants_path}")
+    print(f"Fetched {len(ddl_by_view)} view definition(s), grants for {len(grants_by_view)} view(s), "
+          f"and object ids for {len(principal_directory)}/{len(all_principals)} principal(s) "
+          f"from {args.catalog} -> {sql_path}, {grants_path}")
+    if unresolved:
+        print(f"  {len(unresolved)} principal(s) could not be resolved to an Azure AD object id "
+              f"via SCIM (not found as a Databricks group or user): {unresolved}")
 
     # Reuse the exact same parsing path as the file-based `extract` command so
     # downstream translate/map-roles/deploy behave identically regardless of
@@ -146,13 +154,29 @@ def cmd_extract_databricks(args: argparse.Namespace) -> None:
         print(f"  {len(unsupported)} view(s) flagged for manual review: {unsupported}")
 
 
-def cmd_translate(args: argparse.Namespace) -> None:
-    views = _run_extraction(args.views, args.grants)
-    cls_entitlements, rls_entitlements, _ = _run_translation(views)
+def cmd_grant_catalog_access(args: argparse.Namespace) -> None:
+    """One-time bootstrap step. Must be run with a catalog owner's or
+    metastore admin's own token -- never with the extraction service
+    principal's token, since it doesn't have this privilege yet (that's the
+    whole point of this command).
+    """
+    client = DatabricksApiClient(
+        workspace_url=args.workspace_url,
+        bearer_token=args.token,
+        dry_run=not args.execute,
+    )
+    result = client.grant_catalog_access(args.warehouse_id, args.catalog, args.principal, args.mode)
 
-    principal_dir = {}
-    if args.ags_export:
-        principal_dir = group_directory(load_ags_export(args.ags_export))
+    if not args.execute:
+        print(f"DRY-RUN: would run on {args.catalog}: {result.payload['statement']}")
+        return
+
+    print(f"Applied to {args.catalog}: {result.payload['statement']}")
+
+
+def cmd_translate(args: argparse.Namespace) -> None:
+    views, principal_dir = _run_extraction(args.views, args.grants)
+    cls_entitlements, rls_entitlements = _run_translation(views)
 
     fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, principal_dir)
 
@@ -168,29 +192,25 @@ def cmd_translate(args: argparse.Namespace) -> None:
 
 
 def cmd_map_roles(args: argparse.Namespace) -> None:
-    views = _run_extraction(args.views, args.grants)
-    cls_entitlements, rls_entitlements, _ = _run_translation(views)
-    ags_records = load_ags_export(args.ags_export)
-    fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, group_directory(ags_records))
-    mapping_rows = build_role_mapping(fabric_roles, ags_records)
+    views, principal_dir = _run_extraction(args.views, args.grants)
+    cls_entitlements, rls_entitlements = _run_translation(views)
+    fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, principal_dir)
+    mapping_rows = build_role_mapping(fabric_roles)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    _write_json(os.path.join(args.out_dir, "ags_role_mapping.json"), mapping_rows)
-    _write_csv(os.path.join(args.out_dir, "ags_role_mapping.csv"), mapping_rows)
+    _write_json(os.path.join(args.out_dir, "role_mapping.json"), mapping_rows)
+    _write_csv(os.path.join(args.out_dir, "role_mapping.csv"), mapping_rows)
 
-    unresolved = [r["adGroupName"] for r in mapping_rows if r["unresolvedAdGroup"]]
-    print(f"Role mapping rows: {len(mapping_rows)} -> {args.out_dir}/ags_role_mapping.csv")
+    unresolved = [r["principalName"] for r in mapping_rows if r["unresolvedPrincipalObjectId"]]
+    print(f"Role mapping rows: {len(mapping_rows)} -> {args.out_dir}/role_mapping.csv")
     if unresolved:
-        print(f"  WARNING: {len(unresolved)} AD group(s) not found in AGS export: {unresolved}")
+        print(f"  WARNING: {len(unresolved)} principal(s) have no known object id "
+              f"(not in --grants' principal_object_id column): {unresolved}")
 
 
 def cmd_deploy(args: argparse.Namespace) -> None:
-    views = _run_extraction(args.views, args.grants)
-    cls_entitlements, rls_entitlements, _ = _run_translation(views)
-
-    principal_dir = {}
-    if args.ags_export:
-        principal_dir = group_directory(load_ags_export(args.ags_export))
+    views, principal_dir = _run_extraction(args.views, args.grants)
+    cls_entitlements, rls_entitlements = _run_translation(views)
     fabric_roles = build_fabric_roles(cls_entitlements, rls_entitlements, principal_dir)
 
     with open(args.targets, encoding="utf-8") as fh:
@@ -227,11 +247,8 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     cmd_extract(args)
     print("== Step 2/4: translate ==")
     cmd_translate(args)
-    if args.ags_export:
-        print("== Step 3/4: map-roles ==")
-        cmd_map_roles(args)
-    else:
-        print("== Step 3/4: map-roles (skipped, no --ags-export supplied) ==")
+    print("== Step 3/4: map-roles ==")
+    cmd_map_roles(args)
     if args.targets:
         print("== Step 4/4: deploy (dry-run unless --apply) ==")
         cmd_deploy(args)
@@ -245,39 +262,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--views", required=True, help="Path to a .sql file containing CREATE VIEW statements")
-        p.add_argument("--grants", help="Path to a grants CSV (view,principal,privilege) -- who holds SELECT on each view")
+        p.add_argument("--grants", help="Path to a grants CSV (view,principal,principal_object_id,privilege) -- who holds SELECT on each view")
         p.add_argument("--out-dir", default="out", help="Directory to write output artifacts to")
 
     p_extract = sub.add_parser("extract", help="Parse a local view SQL file into structured security definitions")
     common(p_extract)
     p_extract.set_defaults(func=cmd_extract)
 
+    def common_databricks_connection(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--workspace-url", required=True, help="e.g. https://adb-1234567890123456.7.azuredatabricks.net")
+        p.add_argument("--warehouse-id", required=True, help="SQL warehouse id used to run the query")
+        p.add_argument("--token", default=os.environ.get("DATABRICKS_TOKEN"), help="PAT or AAD token; defaults to $DATABRICKS_TOKEN")
+        p.add_argument("--execute", action="store_true", help="Actually call Databricks (default: dry-run, no network call)")
+
     p_extract_dbx = sub.add_parser(
         "extract-databricks",
-        help="Pull view DDL live from Unity Catalog (Databricks-side step, no Fabric credentials used)",
+        help="Pull view DDL + SELECT grants + principal object ids live from Unity Catalog (no Fabric credentials used)",
     )
-    p_extract_dbx.add_argument("--workspace-url", required=True, help="e.g. https://adb-1234567890123456.7.azuredatabricks.net")
-    p_extract_dbx.add_argument("--warehouse-id", required=True, help="SQL warehouse id used to run the extraction query")
+    common_databricks_connection(p_extract_dbx)
     p_extract_dbx.add_argument("--catalog", required=True, help="Unity Catalog catalog to scan")
     p_extract_dbx.add_argument("--schema", default=None, help="Restrict to one schema (default: whole catalog)")
-    p_extract_dbx.add_argument("--token", default=os.environ.get("DATABRICKS_TOKEN"), help="PAT or AAD service-principal token; defaults to $DATABRICKS_TOKEN")
-    p_extract_dbx.add_argument("--execute", action="store_true", help="Actually call Databricks (default: dry-run, no network call)")
-    p_extract_dbx.add_argument("--out-dir", default="out", help="Directory to write extracted_views.sql and view_security_definitions.json to")
+    p_extract_dbx.add_argument("--out-dir", default="out", help="Directory to write extracted_views.sql / extracted_grants.csv / view_security_definitions.json to")
     p_extract_dbx.set_defaults(func=cmd_extract_databricks)
+
+    p_grant = sub.add_parser(
+        "grant-catalog-access",
+        help="One-time bootstrap (run as a catalog owner/admin): let the extraction identity see every view + grant in a catalog",
+    )
+    common_databricks_connection(p_grant)
+    p_grant.add_argument("--catalog", required=True, help="Catalog to grant access on")
+    p_grant.add_argument("--principal", required=True, help="The extraction service principal's name or application id")
+    p_grant.add_argument("--mode", choices=["owner", "all_privileges"], default="owner", help="Transfer catalog ownership, or grant ALL PRIVILEGES without changing the owner (default: owner)")
+    p_grant.set_defaults(func=cmd_grant_catalog_access)
 
     p_translate = sub.add_parser("translate", help="Extract + translate into CLS/RLS entitlements and Fabric roles")
     common(p_translate)
-    p_translate.add_argument("--ags-export", help="AGS export CSV for AD group object-id enrichment")
     p_translate.set_defaults(func=cmd_translate)
 
-    p_map = sub.add_parser("map-roles", help="Build the AGS -> AD Group -> Fabric Role mapping report")
+    p_map = sub.add_parser("map-roles", help="Build the AD Group/principal -> Fabric Role -> OneLake object mapping report")
     common(p_map)
-    p_map.add_argument("--ags-export", required=True, help="AGS export CSV")
     p_map.set_defaults(func=cmd_map_roles)
 
     p_deploy = sub.add_parser("deploy", help="Deploy translated roles to Fabric (dry-run by default)")
     common(p_deploy)
-    p_deploy.add_argument("--ags-export", help="AGS export CSV for AD group object-id enrichment")
     p_deploy.add_argument("--targets", required=True, help="JSON file mapping table -> {workspaceId, itemId}")
     p_deploy.add_argument("--bearer-token", default=os.environ.get("FABRIC_API_TOKEN"))
     p_deploy.add_argument("--apply", action="store_true", help="Actually call the Fabric API (default: dry-run)")
@@ -285,7 +312,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_all = sub.add_parser("run-all", help="Run the full extract -> translate -> map-roles -> deploy pipeline")
     common(p_all)
-    p_all.add_argument("--ags-export")
     p_all.add_argument("--targets")
     p_all.add_argument("--bearer-token", default=os.environ.get("FABRIC_API_TOKEN"))
     p_all.add_argument("--apply", action="store_true")

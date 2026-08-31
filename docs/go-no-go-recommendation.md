@@ -4,12 +4,13 @@
 
 Automated translation of Databricks Unity Catalog view-based access into
 Microsoft Fabric OneLake security roles is **technically viable** and was
-demonstrated end-to-end in this spike's proof of concept: extraction (both
-Unity Catalog SELECT grants and view shape), translation (including the
-derived-column assumption and verbatim WHERE-clause reproduction, including
-OR-joined predicates), AGS-to-Fabric-role mapping, and a dry-run automated
-deployment all work against representative view patterns, with 28/28
-automated tests passing (see [poc-findings.md](./poc-findings.md)).
+demonstrated end-to-end in this spike's proof of concept: extraction (Unity
+Catalog SELECT grants, principal object ids via SCIM, and view shape),
+translation (including the derived-column assumption and verbatim
+WHERE-clause reproduction, including OR-joined predicates), AD
+Group/principal-to-Fabric-role mapping, and a dry-run automated deployment
+all work against representative view patterns, with 37/37 automated tests
+passing (see [poc-findings.md](./poc-findings.md)).
 
 The model settled on is deliberately simple: a view's grantees come from
 Unity Catalog's actual `SELECT` grants (queried directly, never inferred
@@ -55,9 +56,11 @@ stop.
 - **Required Fabric APIs identified.** The Item Data Access Roles API is
   the correct provisioning target and matches the ticket's own
   `OneLake Security Role` language.
-- **AGS remains authoritative.** The design never writes to AGS or AD
-  groups; it only reads exports, satisfying a hard constraint from the
-  ticket's scope and success criteria.
+- **Identity stays read-only and single-sourced.** The design never writes
+  to Databricks/Entra group membership; it only reads Unity Catalog grants
+  and SCIM directory data directly, with no separate identity export to
+  keep in sync. The one write it performs (`grant-catalog-access`) is a
+  one-time, admin-run catalog access grant, not an identity change.
 - **Access is read from the real source of truth.** Grants come from Unity
   Catalog's own `SELECT` privilege data, not guessed from SQL patterns —
   removing an entire category of "did we parse the identity check
@@ -78,9 +81,10 @@ stop.
   spike, not just designed on paper.
 - **Failure modes degrade safely.** Unrecognized SQL constructs (joins,
   nested views, `SELECT *`) are flagged for manual review rather than
-  silently mis-translated; a grantee missing from the AGS export blocks
-  deployment rather than deploying with a missing member; deploys default
-  to dry-run and never touch a manually-authored Fabric role.
+  silently mis-translated; a grantee whose Azure AD object id can't be
+  resolved blocks deployment rather than deploying with a missing member;
+  deploys default to dry-run and never touch a manually-authored Fabric
+  role.
 
 ## Why not an unconditional Go
 

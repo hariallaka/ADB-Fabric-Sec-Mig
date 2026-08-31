@@ -1,8 +1,0 @@
-ags_id,ags_name,ad_group_name,ad_group_object_id
-AGS-1001,Finance Data Readers,finance_readers,7c3a4e10-1111-4a2b-9c1d-000000000001
-AGS-1002,HR Readers,hr_readers,7c3a4e10-2222-4a2b-9c1d-000000000002
-AGS-1003,Sales Region US,sales_region_us,7c3a4e10-3333-4a2b-9c1d-000000000003
-AGS-1004,Sales Region EU,sales_region_eu,7c3a4e10-4444-4a2b-9c1d-000000000004
-AGS-1005,Sales Finance,sales_finance,7c3a4e10-5555-4a2b-9c1d-000000000005
-AGS-1006,Export Team,export_team,7c3a4e10-6666-4a2b-9c1d-000000000006
-AGS-1007,Sales Admin,sales_admin,7c3a4e10-7777-4a2b-9c1d-000000000007

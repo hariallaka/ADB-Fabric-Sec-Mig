@@ -3,11 +3,11 @@
 Proof-of-concept toolkit for the spike: *"Assess and validate an automated
 approach for extracting and translating Databricks (UC) security
 definitions into Microsoft Fabric security constructs."* It reads who
-actually holds `SELECT` on a Databricks Unity Catalog view, works out what
-data that grant covers (which physical columns, and what row filter),
-translates that into Fabric-native OneLake security roles, maps AGS-managed
-AD groups onto those roles, and automates deployment through the Fabric
-REST API and Azure DevOps pipelines.
+actually holds `SELECT` on a Databricks Unity Catalog view — including each
+principal's Azure AD object id — works out what data that grant covers
+(which physical columns, and what row filter), translates that into
+Fabric-native OneLake security roles, and automates deployment through the
+Fabric REST API and Azure DevOps pipelines.
 
 **Spike outcome:** Conditional Go — see
 [`docs/go-no-go-recommendation.md`](docs/go-no-go-recommendation.md). The
@@ -21,13 +21,17 @@ relying on this for coverage; see
 ## How access is determined (read this first)
 
 Two independent things are extracted per view, and joined by view name —
-**access never comes from parsing the view's SQL**:
+**access never comes from parsing the view's SQL, and never from a
+separate AD-Group-Sync (AGS) export**:
 
 1. **Who** — every principal (AD group or user) holding `SELECT` on the
    view, read directly from Unity Catalog's own grant metadata
-   (`information_schema.table_privileges`), or from a plain grants CSV for
-   offline/test use. This is the *only* source of access; nothing about a
-   principal's access is inferred from the view's `SELECT`/`WHERE` text.
+   (`information_schema.table_privileges`), together with that principal's
+   Azure AD object id (resolved via the Databricks workspace SCIM API), or
+   from a plain grants CSV for offline/test use. This is the *only* source
+   of access; nothing about a principal's access is inferred from the
+   view's `SELECT`/`WHERE` text, and nothing is cross-referenced against an
+   external identity export.
 2. **What** — the view's SQL, parsed only to work out what data a grant
    covers:
    - **CLS**: every physical column referenced anywhere in the SELECT list
@@ -57,19 +61,21 @@ the same way as `AND` — verbatim, by construction, not as a special case
 |---|---|
 | Technical Assessment Document | [`docs/technical-assessment.md`](docs/technical-assessment.md) |
 | Architecture Diagram | [`docs/architecture.md`](docs/architecture.md) |
-| Security Role Mapping (AGS → AD Group → Fabric Role) | [`docs/security-role-mapping.md`](docs/security-role-mapping.md) |
+| Security Role Mapping (AD Group/principal → Fabric Role) | [`docs/security-role-mapping.md`](docs/security-role-mapping.md) |
 | Limitation Analysis | [`docs/limitations.md`](docs/limitations.md) |
 | Proof-of-Concept Findings (AC1–AC5 evidence) | [`docs/poc-findings.md`](docs/poc-findings.md) |
 | Go/No-Go Recommendation | [`docs/go-no-go-recommendation.md`](docs/go-no-go-recommendation.md) |
 | Reference implementation | [`src/dbx_fabric_security/`](src/dbx_fabric_security/) |
+| Interactive notebook extraction (logged-in-user identity) | [`notebooks/`](notebooks/) |
 | Azure DevOps pipeline — Databricks-side extraction | [`pipelines/azure-pipelines-databricks-extract.yml`](pipelines/azure-pipelines-databricks-extract.yml) |
 | Azure DevOps pipeline — Fabric-side translate/deploy | [`pipelines/azure-pipelines-security-migration.yml`](pipelines/azure-pipelines-security-migration.yml) |
-| Automated tests (28 passing) | [`tests/`](tests/) |
+| Automated tests (37 passing) | [`tests/`](tests/) |
 
 ## How it works
 
 ```
 Unity Catalog SELECT grants  ──────┐   (Databricks-side identity)
+   + principal object ids (SCIM)   │
                                     ├─► Security Extraction Utility
 Databricks/UCM View SQL      ──────┘     (view_parser.py, sqlglot-based;
                                            databricks_client.py for live pulls)
@@ -81,7 +87,7 @@ Databricks/UCM View SQL      ──────┘     (view_parser.py, sqlglot-
                        Translator (translator/*.py)              (Fabric-side identity)
                                               │
                                               ▼
-              Fabric Data Access Role payloads + AGS→Role mapping
+              Fabric Data Access Role payloads + AD Group/principal → Role mapping
                                               │
                                               ▼
    Azure DevOps Pipelines (Extract [Databricks] → Translate → Validate → Approve → Deploy → Report [Fabric])
@@ -107,7 +113,6 @@ pip install pytest  # for the test suite
 python -m dbx_fabric_security.cli run-all \
   --views tests/fixtures/sample_views.sql \
   --grants tests/fixtures/grants_sample.csv \
-  --ags-export tests/fixtures/ags_export_sample.csv \
   --targets tests/fixtures/deploy_targets_sample.json \
   --out-dir out/demo
 
@@ -116,13 +121,14 @@ pytest tests/ -v
 ```
 
 Individual stages are also available: `extract`, `extract-databricks`,
-`translate`, `map-roles`, `deploy` (see
-`python -m dbx_fabric_security.cli --help`). `extract-databricks` and
-`deploy` both default to a network-free dry run; they only call a live API
-when given `--execute`/`--apply` respectively, plus a valid token.
-`--grants` (a `view,principal,privilege` CSV) is how every offline command
-learns who has access — omit it and no CLS/RLS entitlements are produced,
-by design (see "How access is determined" above).
+`grant-catalog-access`, `translate`, `map-roles`, `deploy` (see
+`python -m dbx_fabric_security.cli --help`). `extract-databricks`,
+`grant-catalog-access`, and `deploy` all default to a network-free dry run;
+they only call a live API when given `--execute`/`--execute`/`--apply`
+respectively, plus a valid token. `--grants` (a
+`view,principal,principal_object_id,privilege` CSV) is how every offline
+command learns who has access — omit it and no CLS/RLS entitlements are
+produced, by design (see "How access is determined" above).
 
 ## Running the stages separately (Databricks-side vs. Fabric-side)
 
@@ -132,6 +138,28 @@ under separate identities, on separate schedules** — this is the model to
 use today. Consolidating onto one Azure AD identity with both sets of
 permissions (see RBAC below) is a later, purely operational change; no code
 here needs to change for that.
+
+**0. One-time bootstrap — run once by a catalog owner/admin, not the
+extraction identity:**
+
+```bash
+python -m dbx_fabric_security.cli grant-catalog-access \
+  --workspace-url https://adb-1234567890123456.7.azuredatabricks.net \
+  --warehouse-id <sql-warehouse-id> \
+  --catalog sec \
+  --principal dbx-fabric-extraction-sp \
+  --mode owner \
+  --token "$ADMIN_TOKEN" \
+  --execute
+```
+
+Makes the extraction service principal (`--principal`) able to see every
+view's definition and every principal's grant in the catalog — without
+this, extraction only sees what the identity's *own* grants entitle it to.
+See "RBAC / permissions required" below for why this is needed. Run with
+`--token` belonging to a catalog owner or metastore admin, never with the
+extraction identity's own token (it can't grant itself this privilege —
+that's the point).
 
 **1. Extract — runs against Databricks only, no Fabric credentials used:**
 
@@ -147,33 +175,33 @@ python -m dbx_fabric_security.cli extract-databricks \
 
 This writes `out/databricks-extract/extracted_views.sql` (the raw,
 reconstructed `CREATE VIEW` DDL) **and** `extracted_grants.csv` (every
-principal holding SELECT on each view, in the same `view,principal,privilege`
-shape as the offline fixture) — together, a durable, reviewable pair of
-artifacts you can hand off, commit, or archive — plus
-`view_security_definitions.json` (the structured extraction result). Omit
-`--execute` to see the request that *would* be made without calling
-Databricks at all.
+principal holding SELECT on each view, together with its resolved Azure AD
+object id, in `view,principal,principal_object_id,privilege` shape) —
+together, a durable, reviewable pair of artifacts you can hand off, commit,
+or archive — plus `view_security_definitions.json` (the structured
+extraction result). Omit `--execute` to see the request that *would* be
+made without calling Databricks at all.
 
 This step can equally run as its own Azure DevOps pipeline
 ([`pipelines/azure-pipelines-databricks-extract.yml`](pipelines/azure-pipelines-databricks-extract.yml)),
 a Databricks Job "Python script" task, or ad hoc from a workstation — it's
-a plain REST call (Databricks SQL Statement Execution API), no ODBC driver
-or live Spark session required.
+a plain REST call (Databricks SQL Statement Execution API + SCIM API), no
+ODBC driver or live Spark session required. Prefer to run it interactively
+inside a notebook instead, as yourself, with no separate credential at all?
+See [`notebooks/`](notebooks/).
 
-**2. Translate / map-roles / deploy — run against Fabric (and read an AGS
-export), no Databricks credentials used:**
+**2. Translate / map-roles / deploy — run against Fabric, no Databricks
+credentials used:**
 
 ```bash
 python -m dbx_fabric_security.cli translate \
   --views out/databricks-extract/extracted_views.sql \
   --grants out/databricks-extract/extracted_grants.csv \
-  --ags-export path/to/ags_export.csv \
   --out-dir out/fabric-translate
 
 python -m dbx_fabric_security.cli deploy \
   --views out/databricks-extract/extracted_views.sql \
   --grants out/databricks-extract/extracted_grants.csv \
-  --ags-export path/to/ags_export.csv \
   --targets path/to/deploy_targets.json \
   --bearer-token "$FABRIC_API_TOKEN" \
   --apply \
@@ -181,8 +209,10 @@ python -m dbx_fabric_security.cli deploy \
 ```
 
 These take `extracted_views.sql` + `extracted_grants.csv` from step 1 as
-plain input — this pipeline never needs to reach Databricks itself. In
-Azure DevOps, this is
+plain input — this pipeline never needs to reach Databricks itself, and the
+principal object ids it needs for Fabric role `members` payloads travel
+inside `extracted_grants.csv`, not a separate identity file. In Azure
+DevOps, this is
 [`pipelines/azure-pipelines-security-migration.yml`](pipelines/azure-pipelines-security-migration.yml),
 which consumes step 1's pipeline artifact via a `resources.pipelines`
 reference (or locally-supplied files, for dev/test — see the
@@ -207,20 +237,18 @@ Databricks accepts either as a bearer token) needs:
 | Permission | Why |
 |---|---|
 | `CAN_USE` on the SQL warehouse referenced by `--warehouse-id` | Required to run any query via the Statement Execution API. |
-| `USE CATALOG` on each catalog being scanned | Required to reference `<catalog>.information_schema` at all. |
-| `USE SCHEMA` on each schema being scanned (or catalog-level `USE SCHEMA` inherited) | Required to enumerate views within a schema. |
-| `SELECT` (or `BROWSE`) on each view being extracted | Unity Catalog only exposes a view's SQL text (`information_schema.views.view_definition`) to a caller who could otherwise query the view. |
-| **Ownership of, or `MANAGE`/`ALL PRIVILEGES` on, each view — or account/metastore admin** | This is the one easy to under-provision: `information_schema.table_privileges` only surfaces the grants a caller is entitled to see (broadly: privileges *they* hold or granted, or all privileges if they own the object, hold `MANAGE` on it, or are a metastore/account admin). A caller with only `SELECT` on a view will **not** see other principals' grants on it — the extraction identity needs one of the elevated options above to read the *complete* grantee list, not just its own. |
+| **Ownership of, or `ALL PRIVILEGES`/`MANAGE` on, every catalog being scanned — see "One-time bootstrap" above** | This is the one easy to under-provision: `information_schema.views.view_definition` and `information_schema.table_privileges` only surface what the caller is entitled to see. A caller with only `SELECT` on a view sees that view's own definition but **not** other principals' grants on it. Ownership (or `MANAGE`/admin) is what makes the *complete* view list and *complete* grantee list visible, not just the caller's own. `grant-catalog-access` (see step 0 above) sets this up in one command, run once by an existing catalog owner/admin. |
+| SCIM read access on the workspace (typically **workspace admin**) | Required for `fetch_principal_directory` to resolve a grantee name to its Azure AD object id via the workspace SCIM API (`/api/2.0/preview/scim/v2/Groups` and `/Users`). Without it, extraction still runs but every principal comes back with an empty `principal_object_id` in `extracted_grants.csv`, flagged unresolved downstream. |
 
-No write privilege of any kind is required — extraction only ever runs
-`SELECT` queries against `information_schema`. Recommended: create a
-dedicated Databricks service principal, make it an **owner (or grant it
-`MANAGE`) on every catalog/schema in scope** so ownership cascades to the
-views within, or — more simply for a broad rollout — grant it
-**metastore/account admin** read access if your governance model allows a
-read-only admin role; document whichever choice is made, since it's the
-permission most likely to be missed in a narrower first attempt. Use this
-identity as the pipeline's `DATABRICKS_TOKEN` — do not reuse a human's PAT.
+No write privilege of any kind is required for the *recurring* extraction
+run — it only ever runs `SELECT` queries against `information_schema` plus
+read-only SCIM lookups. (`grant-catalog-access` is the one write operation
+in this toolkit, and it's a one-time bootstrap step run by an admin, not
+part of the recurring pipeline.) Recommended: create a dedicated Databricks
+service principal, run `grant-catalog-access --mode owner` (or
+`all_privileges`, if you'd rather not transfer ownership) once per
+in-scope catalog, grant it workspace admin for SCIM read access, and use it
+as the pipeline's `DATABRICKS_TOKEN` identity — do not reuse a human's PAT.
 
 ### Fabric side — for the translate/map-roles/deploy steps
 
@@ -233,12 +261,10 @@ holding a Fabric API bearer token) needs:
 | Workspace role of at least **Contributor** on each target workspace (or **Admin**, if the pipeline should also be able to create net-new Lakehouse items rather than only update roles on existing ones) | The Item Data Access Roles API operates at the item level and requires edit rights on the containing workspace/item. |
 | An Azure AD app registration with a client secret or certificate, used for the client-credentials (service-principal) OAuth flow against Fabric's token endpoint | This is the credential exchanged for the bearer token passed to `--bearer-token` / `FABRIC_API_TOKEN`. |
 
-No Microsoft Graph / Entra ID group-management permission is required —
-this toolkit only *reads* an AGS export file to resolve principal names to
-object ids; it never queries or writes group membership directly. (A
-future enhancement that reads AGS/Entra live rather than from an export
-would additionally need `GroupMember.Read.All` or similar — out of scope
-today.)
+No Microsoft Graph / Entra ID group-management permission is required on
+this side — the Fabric-side steps only *read* the `principal_object_id`
+column already sitting in `extracted_grants.csv` (resolved earlier, on the
+Databricks side); they never call Graph or Entra themselves.
 
 ### Today vs. target state
 
@@ -271,8 +297,8 @@ Verified by `tests/test_view_parser.py::test_derived_column_assumption` and
 ## Scope note
 
 This is a **spike**, not a production implementation. Production build-out,
-migration of existing security policies, AGS enhancements, and runtime
-permission synchronization are explicitly out of scope, per the spike's
-requirements — see [`docs/technical-assessment.md`](docs/technical-assessment.md)
-and [`docs/limitations.md`](docs/limitations.md) for what was and wasn't
+migration of existing security policies, and runtime permission
+synchronization are explicitly out of scope, per the spike's requirements —
+see [`docs/technical-assessment.md`](docs/technical-assessment.md) and
+[`docs/limitations.md`](docs/limitations.md) for what was and wasn't
 proven.

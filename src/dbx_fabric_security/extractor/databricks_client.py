@@ -165,3 +165,79 @@ class DatabricksApiClient:
             if grantee not in grants_by_view[fq_name]:
                 grants_by_view[fq_name].append(grantee)
         return grants_by_view
+
+    def _scim_lookup(self, resource: str, filter_field: str, value: str) -> dict | None:
+        url = f"{self.workspace_url}/api/2.0/preview/scim/v2/{resource}"
+        escaped = value.replace('"', '\\"')
+        resp = requests.get(
+            url, headers=self._headers(), params={"filter": f'{filter_field} eq "{escaped}"'}, timeout=self.timeout
+        )
+        resp.raise_for_status()
+        resources = resp.json().get("Resources", [])
+        return resources[0] if resources else None
+
+    def fetch_principal_object_id(self, principal_name: str) -> tuple[str | None, str]:
+        """Resolves a Unity Catalog grantee name to its Azure AD object id via
+        the workspace SCIM API. Tries Groups first (``externalId``, populated
+        when the group is synced from Azure AD via SCIM provisioning), then
+        Users. Returns ``(object_id_or_None, principal_type)`` where
+        ``principal_type`` is ``"GROUP"``, ``"USER"``, or ``"UNKNOWN"`` if
+        neither SCIM lookup matched.
+
+        Requires the caller to have SCIM read access -- typically workspace
+        admin. See README.md's "Databricks RBAC" section.
+        """
+        if self.dry_run:
+            return None, "UNKNOWN"
+
+        group = self._scim_lookup("Groups", "displayName", principal_name)
+        if group:
+            return group.get("externalId"), "GROUP"
+
+        user = self._scim_lookup("Users", "userName", principal_name)
+        if user:
+            return user.get("externalId"), "USER"
+
+        return None, "UNKNOWN"
+
+    def fetch_principal_directory(self, principal_names: list[str]) -> dict[str, str]:
+        """Resolves a batch of grantee names to their Azure AD object ids
+        (one SCIM lookup per unique name). Names that resolve to neither a
+        group nor a user are omitted -- callers should treat a missing name
+        as unresolved (see ``role_builder.build_fabric_roles``'s
+        ``unresolvedPrincipalObjectId`` flag).
+        """
+        directory: dict[str, str] = {}
+        for name in dict.fromkeys(principal_names):  # de-dupe, preserve order
+            object_id, _principal_type = self.fetch_principal_object_id(name)
+            if object_id:
+                directory[name] = object_id
+        return directory
+
+    def grant_catalog_access(
+        self, warehouse_id: str, catalog: str, principal: str, mode: str = "owner"
+    ) -> DatabricksApiResult:
+        """One-time bootstrap: makes ``principal`` (the extraction service
+        principal) able to see *every* view's definition and *every*
+        principal's grants in ``catalog`` via ``information_schema`` --
+        ``SELECT`` on a view alone only reveals that view's own definition,
+        and ``information_schema.table_privileges`` only surfaces grants the
+        caller is entitled to see (owner, a MANAGE holder, or an admin). See
+        README.md's "Databricks RBAC" section for why this is needed.
+
+        Must be run by a catalog owner or metastore admin -- never by the
+        extraction service principal itself, which doesn't have this
+        privilege yet. ``mode="owner"`` transfers catalog ownership;
+        ``mode="all_privileges"`` grants ALL PRIVILEGES without changing the
+        owner. Dry-run by default like every other call on this client.
+        """
+        if mode not in ("owner", "all_privileges"):
+            raise ValueError("mode must be 'owner' or 'all_privileges'")
+
+        principal_ident = principal.replace("`", "")
+        if mode == "owner":
+            statement = f"ALTER CATALOG `{catalog}` OWNER TO `{principal_ident}`"
+        else:
+            statement = f"GRANT ALL PRIVILEGES ON CATALOG `{catalog}` TO `{principal_ident}`"
+
+        return self.execute_statement(warehouse_id, statement)

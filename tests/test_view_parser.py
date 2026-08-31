@@ -11,7 +11,7 @@ GRANTS_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "grants_sam
 
 @pytest.fixture(scope="module")
 def views():
-    grants = parse_grants_csv(GRANTS_FIXTURE)
+    grants, _principal_dir = parse_grants_csv(GRANTS_FIXTURE)
     return {v.fq_name: v for v in parse_views_file(FIXTURE, grants_by_view=grants)}
 
 
