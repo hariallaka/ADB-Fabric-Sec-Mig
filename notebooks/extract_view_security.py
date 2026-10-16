@@ -202,7 +202,7 @@ import sys
 toolkit_available = False
 try:
     # Adjust if your Repo is checked out somewhere else.
-    repo_src_path = "/Workspace/Repos/<your-checkout>/Utils/databricks-fabric-security-migration/src"
+    repo_src_path = "/Workspace/Repos/<your-checkout>/ADB-Fabric-Sec-Mig/src"
     if repo_src_path not in sys.path:
         sys.path.insert(0, repo_src_path)
 

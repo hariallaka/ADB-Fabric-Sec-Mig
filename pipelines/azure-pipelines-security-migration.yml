@@ -120,7 +120,7 @@ stages:
             inputs:
               versionSpec: "$(pythonVersion)"
           - script: |
-              pip install -e ./databricks-fabric-security-migration
+              pip install -e .
             displayName: "Install toolkit"
           - script: |
               python -m dbx_fabric_security.cli translate \
@@ -149,11 +149,11 @@ stages:
             inputs:
               versionSpec: "$(pythonVersion)"
           - script: |
-              pip install -e ./databricks-fabric-security-migration
+              pip install -e .
               pip install pytest
             displayName: "Install toolkit + test deps"
           - script: |
-              pytest ./databricks-fabric-security-migration/tests -v
+              pytest ./tests -v
             displayName: "Run unit tests"
           - download: current
             artifact: translated-security-model
@@ -199,7 +199,7 @@ stages:
             inputs:
               versionSpec: "$(pythonVersion)"
           - script: |
-              pip install -e ./databricks-fabric-security-migration
+              pip install -e .
             displayName: "Install toolkit"
           - script: |
               python -m dbx_fabric_security.cli deploy \

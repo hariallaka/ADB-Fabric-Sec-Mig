@@ -59,7 +59,7 @@ stages:
             inputs:
               versionSpec: "$(pythonVersion)"
           - script: |
-              pip install -e ./databricks-fabric-security-migration
+              pip install -e .
             displayName: "Install toolkit"
           - script: |
               python -m dbx_fabric_security.cli extract-databricks \
