@@ -17,6 +17,7 @@ from dbx_fabric_security.fabric_sql import (
     parse_role_mapping_csv,
     translate_views,
 )
+from dbx_fabric_security.fabric_sql import build_state, diff_states, load_state, render_revoke_script
 from dbx_fabric_security.fabric_sql.grants import RoleMapping
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -284,6 +285,7 @@ def test_cli_generate_fabric_sql_on_sample_fixtures(tmp_path, capsys):
     out = tmp_path / "fabric_sql"
     assert {p.name for p in out.iterdir()} == {
         "sec__deploy.sql", "sec__needs_review.sql", "fabric_sql_report.json", "fabric_view_grants.csv",
+        "deployed_state.json",
     }
     report = json.loads((out / "fabric_sql_report.json").read_text())
     assert report["summary"]["needsReviewViews"] == 1  # v_my_expense_reports (current_user)
@@ -295,3 +297,123 @@ def test_cli_generate_fabric_sql_on_sample_fixtures(tmp_path, capsys):
     # --strict turns those issues into a failing exit code for a pipeline gate
     assert main(args + ["--strict"]) == 1
     assert "STRICT" in capsys.readouterr().out
+
+
+# ---------- deployed state + revoke ----------
+
+def _state(views, mappings, table_columns=T1_COLUMNS):
+    scripts, admin_views, _, plan, _, _ = _pipeline(views, mappings, table_columns)
+    return build_state(scripts, admin_views, plan)
+
+
+MAPS = [
+    RoleMapping("grp_a", "role_a", "grp_a"),
+    RoleMapping("grp_b", "role_b", "grp_b"),
+    RoleMapping("grp_admin", "super_business_admin", "sg-admins"),
+]
+
+
+def test_state_records_views_in_creation_order_and_grants_per_role():
+    state = _state(_views((V1, ["grp_a"]), (V2, ["grp_b"])), MAPS)
+    cat = state["catalogs"]["cat"]
+    assert cat["views"] == ["[s].[v1]", "[s].[v2]", "[sec_admin].[s__t1]"]
+    assert cat["roles"]["role_a"] == {"members": ["grp_a"], "grants": ["[s].[v1]"]}
+    assert cat["roles"]["super_business_admin"]["grants"] == ["[sec_admin].[s__t1]"]
+
+
+def test_identical_states_produce_no_revocations():
+    views = _views((V1, ["grp_a"]), (V2, ["grp_b"]))
+    assert diff_states(_state(views, MAPS), _state(views, MAPS)) == []
+
+
+def test_grant_removed_in_databricks_is_revoked():
+    before = _state(_views((V1, ["grp_a", "grp_b"]), (V2, ["grp_b"])), MAPS)
+    after = _state(_views((V1, ["grp_a"]), (V2, ["grp_b"])), MAPS)
+    (d,) = diff_states(before, after)
+    assert d.revoke_grants == [("role_b", "[s].[v1]")]
+    assert d.drop_members == [] and d.drop_views == [] and d.drop_roles == []
+    script = render_revoke_script(d, drop_removed_objects=False)
+    assert "REVOKE SELECT ON [s].[v1] FROM [role_b];" in script
+
+
+def test_group_remapped_to_other_role_drops_old_membership():
+    views = _views((V1, ["grp_a"]))
+    before = _state(views, [RoleMapping("grp_a", "role_old", "grp_a")])
+    after = _state(views, [RoleMapping("grp_a", "role_new", "grp_a")])
+    (d,) = diff_states(before, after)
+    assert d.revoke_grants == [("role_old", "[s].[v1]")]
+    assert d.drop_members == [("role_old", "grp_a")]
+    assert d.drop_roles == ["role_old"]
+    assert "ALTER ROLE [role_old] DROP MEMBER [grp_a];" in render_revoke_script(d, False)
+
+
+def test_removed_view_dropped_only_with_flag_and_dependents_first():
+    base = "CREATE VIEW cat.s.base AS SELECT c1 FROM cat.s.t1"
+    child = "CREATE VIEW cat.s.child AS SELECT c1 FROM cat.s.base"
+    known = {"base", "child"}
+    before = _state(_views((base, ["grp_a"]), (child, ["grp_a"]), known=known), MAPS[:1])
+    after = _state(_views((V1, ["grp_a"])), MAPS[:1])
+    (d,) = diff_states(before, after)
+    assert d.drop_views == ["[s].[child]", "[s].[base]"]
+
+    default = render_revoke_script(d, drop_removed_objects=False)
+    assert "NOT RUN" in default
+    assert not any(l.startswith("    DROP VIEW") for l in default.splitlines())
+    assert "--     DROP VIEW [s].[child];" in default
+
+    dropping = render_revoke_script(d, drop_removed_objects=True)
+    assert dropping.index("DROP VIEW [s].[child]") < dropping.index("DROP VIEW [s].[base]")
+    assert dropping.index("REVOKE SELECT") < dropping.index("DROP VIEW")
+
+
+def test_view_that_now_needs_review_loses_its_grants():
+    before = _state(_views((V1, ["grp_a"])), MAPS[:1])
+    blocked_v1 = "CREATE VIEW cat.s.v1 AS SELECT c1 FROM cat.s.t1 WHERE c3 = current_user()"
+    after = _state(_views((blocked_v1, ["grp_a"])), MAPS[:1])
+    (d,) = diff_states(before, after)
+    assert ("role_a", "[s].[v1]") in d.revoke_grants
+    assert "[s].[v1]" in d.drop_views
+
+
+def test_catalog_removed_entirely_is_revoked():
+    before = _state(_views((V1, ["grp_a"])), MAPS[:1])
+    after = {"version": 1, "catalogs": {}}
+    (d,) = diff_states(before, after)
+    assert d.catalog == "cat"
+    assert d.revoke_grants == [("role_a", "[s].[v1]"), ("super_business_admin", "[sec_admin].[s__t1]")]
+
+
+def test_load_state_rejects_foreign_json(tmp_path):
+    p = tmp_path / "x.json"
+    p.write_text('{"some": "thing"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="not a deployed_state.json"):
+        load_state(str(p))
+
+
+def test_cli_previous_state_writes_revoke_script(tmp_path, capsys):
+    views_sql = tmp_path / "views.sql"
+    views_sql.write_text(V1 + ";\n" + V2 + ";\n", encoding="utf-8")
+    cols = tmp_path / "cols.json"
+    cols.write_text(json.dumps(T1_COLUMNS), encoding="utf-8")
+    mapping = tmp_path / "map.csv"
+    mapping.write_text("ad_group,fabric_role\ngrp_a,role_a\ngrp_b,role_b\n", encoding="utf-8")
+
+    def run(grants_rows, out, extra=()):
+        grants = tmp_path / "grants.csv"
+        grants.write_text("view,principal,principal_object_id,privilege\n" + grants_rows, encoding="utf-8")
+        return main([
+            "generate-fabric-sql", "--views", str(views_sql), "--grants", str(grants),
+            "--table-columns", str(cols), "--role-mapping", str(mapping), "--out-dir", str(out), *extra,
+        ])
+
+    assert run("cat.s.v1,grp_a,,SELECT\ncat.s.v2,grp_b,,SELECT\n", tmp_path / "run1") == 0
+    state1 = tmp_path / "run1" / "fabric_sql" / "deployed_state.json"
+    assert run("cat.s.v1,grp_a,,SELECT\n", tmp_path / "run2", ["--previous-state", str(state1)]) == 0
+    revoke = (tmp_path / "run2" / "fabric_sql" / "cat__revoke.sql").read_text()
+    assert "REVOKE SELECT ON [s].[v2] FROM [role_b];" in revoke
+    assert "ALTER ROLE [role_b] DROP MEMBER [grp_b];" in revoke
+    report = json.loads((tmp_path / "run2" / "fabric_sql" / "fabric_sql_report.json").read_text())
+    assert report["revocations"][0]["revokeGrants"] == [{"role": "role_b", "view": "[s].[v2]"}]
+
+    with pytest.raises(SystemExit):
+        run("cat.s.v1,grp_a,,SELECT\n", tmp_path / "run3", ["--drop-removed-objects"])

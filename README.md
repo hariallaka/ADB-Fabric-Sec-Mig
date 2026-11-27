@@ -70,7 +70,8 @@ the same way as `AND` — verbatim, by construction, not as a special case
 | Azure DevOps pipeline — Databricks-side extraction | [`pipelines/azure-pipelines-databricks-extract.yml`](pipelines/azure-pipelines-databricks-extract.yml) |
 | Azure DevOps pipeline — Fabric-side translate/deploy | [`pipelines/azure-pipelines-security-migration.yml`](pipelines/azure-pipelines-security-migration.yml) |
 | Fabric SQL endpoint path (per-view T-SQL views + super-admin views + role grants) | [`docs/fabric-sql-endpoint-views.md`](docs/fabric-sql-endpoint-views.md) |
-| Automated tests (78 passing) | [`tests/`](tests/) |
+| Azure DevOps pipeline — Fabric SQL endpoint path (generate → approve → revoke + deploy via sqlcmd) | [`pipelines/azure-pipelines-fabric-sql-endpoint.yml`](pipelines/azure-pipelines-fabric-sql-endpoint.yml) |
+| Automated tests (87 passing) | [`tests/`](tests/) |
 
 ## How it works
 
@@ -244,6 +245,12 @@ python -m dbx_fabric_security.cli generate-fabric-sql \
   --role-mapping path/to/ad_group_to_fabric_role.csv \
   --out-dir out/fabric-sql
 ```
+
+On later runs, add `--previous-state <previous run>/fabric_sql/deployed_state.json`.
+That writes a `<catalog>__revoke.sql`, to run before the deploy script, which
+revokes grants and role memberships that are no longer in Unity Catalog or the
+mapping. To automate the cycle, use
+[`pipelines/azure-pipelines-fabric-sql-endpoint.yml`](pipelines/azure-pipelines-fabric-sql-endpoint.yml).
 
 Read [`docs/fabric-sql-endpoint-views.md`](docs/fabric-sql-endpoint-views.md)
 before deploying. It lists which views are held back for review, and the

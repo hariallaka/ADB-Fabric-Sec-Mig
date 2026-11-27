@@ -1,0 +1,216 @@
+# Azure DevOps pipeline: Fabric SQL analytics endpoint path.
+#
+# Stages: Generate (tests + generate-fabric-sql, with revoke diff against the
+# last deployed state) -> Deploy (environment approval, then sqlcmd per
+# catalog: __revoke.sql first, then __deploy.sql) -> publish the new
+# deployed state for the next run.
+#
+# See docs/fabric-sql-endpoint-views.md for what the scripts do and the
+# in-tenant checks to make before the first production run.
+#
+# Input: the artifact from pipelines/azure-pipelines-databricks-extract.yml
+# (extractSource=databricksPipeline), or repo files for dev/test
+# (extractSource=localFile). The Databricks extraction is unchanged.
+#
+# Required variable group "dbx-fabric-sql-endpoint":
+#   FABRIC_SQL_ROLE_MAPPING_PATH  - repo-relative path to the AD group -> Fabric role CSV
+#                                   (ad_group,fabric_role[,fabric_principal])
+#   FABRIC_SQL_ENDPOINTS_PATH     - repo-relative path to a JSON file mapping each Unity
+#                                   Catalog catalog to its mirrored item's SQL endpoint:
+#                                   {"sec": {"server": "<id>.datawarehouse.fabric.microsoft.com",
+#                                            "database": "<mirrored item name>"}}
+#                                   A catalog with scripts but no entry fails the deploy.
+#   Only for extractSource=localFile (repo-relative paths):
+#   DATABRICKS_VIEWS_PATH, DATABRICKS_GRANTS_PATH, DATABRICKS_TABLE_COLUMNS_PATH
+#
+# Identity: the Azure service connection's service principal runs sqlcmd
+# with Entra auth (ActiveDirectoryDefault picks up the AzureCLI@2 login).
+# It needs permission to create schemas, views and roles and to grant on
+# each mirrored item's SQL endpoint (typically workspace Member or Admin),
+# and the Fabric tenant setting that lets service principals use Fabric.
+#
+# Revoke state: each successful Deploy publishes deployed_state.json as
+# artifact "fabric-sql-deployed-state". The next run downloads it from the
+# latest *successful* run of this pipeline on the same branch. On the very
+# first run there is none: set firstRun=true once. Otherwise a missing state
+# fails the run rather than silently skipping revocations.
+
+trigger: none # security changes are run on demand or on a schedule, never on every commit
+
+parameters:
+  - name: extractSource
+    displayName: "Where does the Databricks extract come from?"
+    type: string
+    default: databricksPipeline
+    values:
+      - databricksPipeline
+      - localFile
+  - name: azureServiceConnection
+    displayName: "Azure service connection whose service principal deploys to Fabric"
+    type: string
+    default: "fabric-sql-deployer"
+  - name: firstRun
+    displayName: "First run: no previous deployed state exists yet (skip revoke diff)"
+    type: boolean
+    default: false
+  - name: dropRemovedObjects
+    displayName: "Also DROP views/roles no longer deployed (revokes always run)"
+    type: boolean
+    default: false
+  - name: strict
+    displayName: "Fail if any view needs review, any grantee is unmapped, or a role merges different access"
+    type: boolean
+    default: true
+
+resources:
+  pipelines:
+    - pipeline: databricksExtract
+      source: "Databricks Security Extraction" # name of the pipeline created from azure-pipelines-databricks-extract.yml
+      trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: dbx-fabric-sql-endpoint
+  - name: pythonVersion
+    value: "3.11"
+  - name: outDir
+    value: "$(Pipeline.Workspace)/fabric-sql-out"
+  - name: previousStateDir
+    value: "$(Pipeline.Workspace)/previous-state"
+  - ${{ if eq(parameters.extractSource, 'databricksPipeline') }}:
+      - name: viewsPath
+        value: "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_views.sql"
+      - name: grantsPath
+        value: "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_grants.csv"
+      - name: tableColumnsPath
+        value: "$(Pipeline.Workspace)/databricksExtract/extracted-views/extracted_table_columns.json"
+  - ${{ else }}:
+      - name: viewsPath
+        value: "$(Build.SourcesDirectory)/$(DATABRICKS_VIEWS_PATH)"
+      - name: grantsPath
+        value: "$(Build.SourcesDirectory)/$(DATABRICKS_GRANTS_PATH)"
+      - name: tableColumnsPath
+        value: "$(Build.SourcesDirectory)/$(DATABRICKS_TABLE_COLUMNS_PATH)"
+
+stages:
+  - stage: Generate
+    displayName: "Test and generate T-SQL scripts"
+    jobs:
+      - job: GenerateJob
+        steps:
+          - checkout: self
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(pythonVersion)"
+          - script: |
+              pip install -e . pytest
+            displayName: "Install toolkit"
+          - script: |
+              pytest ./tests -q
+            displayName: "Run unit tests"
+
+          - ${{ if eq(parameters.extractSource, 'databricksPipeline') }}:
+              - download: databricksExtract
+                artifact: extracted-views
+
+          - ${{ if eq(parameters.firstRun, false) }}:
+              - task: DownloadPipelineArtifact@2
+                displayName: "Download deployed state from last successful run"
+                inputs:
+                  source: specific
+                  project: "$(System.TeamProjectId)"
+                  pipeline: "$(System.DefinitionId)"
+                  runVersion: latestFromBranch
+                  runBranch: "$(Build.SourceBranch)"
+                  artifact: fabric-sql-deployed-state
+                  path: "$(previousStateDir)"
+
+          - script: |
+              set -euo pipefail
+              ARGS=(
+                --views "$(viewsPath)"
+                --grants "$(grantsPath)"
+                --table-columns "$(tableColumnsPath)"
+                --role-mapping "$(Build.SourcesDirectory)/$(FABRIC_SQL_ROLE_MAPPING_PATH)"
+                --out-dir "$(outDir)"
+              )
+              if [ "${{ parameters.firstRun }}" != "True" ]; then
+                ARGS+=(--previous-state "$(previousStateDir)/deployed_state.json")
+              fi
+              if [ "${{ parameters.dropRemovedObjects }}" == "True" ]; then
+                ARGS+=(--drop-removed-objects)
+              fi
+              if [ "${{ parameters.strict }}" == "True" ]; then
+                ARGS+=(--strict)
+              fi
+              python -m dbx_fabric_security.cli generate-fabric-sql "${ARGS[@]}"
+              cp "$(Build.SourcesDirectory)/$(FABRIC_SQL_ENDPOINTS_PATH)" "$(outDir)/fabric_sql/endpoints.json"
+            displayName: "Generate deploy / revoke / review scripts"
+
+          - publish: "$(outDir)/fabric_sql"
+            artifact: fabric-sql-scripts
+            displayName: "Publish scripts for review"
+            condition: succeededOrFailed() # keep the report even when --strict fails the run
+
+  - stage: Deploy
+    displayName: "Deploy to Fabric SQL endpoints"
+    dependsOn: Generate
+    jobs:
+      - deployment: DeployJob
+        environment: "fabric-security-prod" # configure a required-reviewer approval on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: fabric-sql-scripts
+
+                - script: |
+                    set -euo pipefail
+                    if ! sqlcmd --version 2>/dev/null | grep -qi "sqlcmd: v"; then
+                      curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc >/dev/null
+                      sudo add-apt-repository -y "$(wget -qO- https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list)"
+                      sudo apt-get update -q
+                      sudo apt-get install -y -q sqlcmd
+                    fi
+                    sqlcmd --version
+                  displayName: "Install go-sqlcmd (Entra auth support)"
+
+                - task: AzureCLI@2
+                  displayName: "Run revoke then deploy script per catalog"
+                  inputs:
+                    azureSubscription: "${{ parameters.azureServiceConnection }}"
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      DIR="$(Pipeline.Workspace)/fabric-sql-scripts"
+                      python3 - "$DIR" > "$DIR/run_plan.tsv" <<'PY'
+                      import json, os, sys
+                      d = sys.argv[1]
+                      endpoints = json.load(open(os.path.join(d, "endpoints.json")))
+                      catalogs = sorted({f.split("__")[0] for f in os.listdir(d)
+                                         if f.endswith(("__deploy.sql", "__revoke.sql"))})
+                      missing = [c for c in catalogs if c not in endpoints]
+                      if missing:
+                          sys.exit(f"No SQL endpoint configured for catalog(s) {missing} in endpoints.json; refusing to deploy.")
+                      for c in catalogs:
+                          print("\t".join([c, endpoints[c]["server"], endpoints[c]["database"]]))
+                      PY
+                      while IFS=$'\t' read -r CATALOG SERVER DATABASE; do
+                        for KIND in revoke deploy; do
+                          FILE="$DIR/${CATALOG}__${KIND}.sql"
+                          [ -f "$FILE" ] || continue
+                          echo "== $CATALOG: $KIND -> $SERVER / $DATABASE"
+                          sqlcmd -S "$SERVER" -d "$DATABASE" \
+                            --authentication-method ActiveDirectoryDefault \
+                            -b -i "$FILE"
+                        done
+                      done < "$DIR/run_plan.tsv"
+
+                # Only reached when every script above succeeded.
+                - publish: "$(Pipeline.Workspace)/fabric-sql-scripts/deployed_state.json"
+                  artifact: fabric-sql-deployed-state
+                  displayName: "Publish deployed state for the next run's revoke diff"

@@ -1,0 +1,6 @@
+{
+  "sec": {
+    "server": "<endpoint-id>.datawarehouse.fabric.microsoft.com",
+    "database": "<mirrored item name for catalog sec>"
+  }
+}

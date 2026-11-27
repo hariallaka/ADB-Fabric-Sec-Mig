@@ -13,6 +13,13 @@ one table-level RLS + CLS role. See ``docs/fabric-sql-endpoint-views.md``.
 from dbx_fabric_security.fabric_sql.admin_views import AdminExclusion, AdminView, build_admin_views
 from dbx_fabric_security.fabric_sql.grants import RolePlan, build_role_plan, parse_role_mapping_csv
 from dbx_fabric_security.fabric_sql.script import build_fabric_sql_outputs
+from dbx_fabric_security.fabric_sql.state import (
+    CatalogDiff,
+    build_state,
+    diff_states,
+    load_state,
+    render_revoke_script,
+)
 from dbx_fabric_security.fabric_sql.views import FabricViewScript, translate_views
 
 __all__ = [
@@ -23,6 +30,11 @@ __all__ = [
     "build_role_plan",
     "parse_role_mapping_csv",
     "build_fabric_sql_outputs",
+    "CatalogDiff",
+    "build_state",
+    "diff_states",
+    "load_state",
+    "render_revoke_script",
     "FabricViewScript",
     "translate_views",
 ]

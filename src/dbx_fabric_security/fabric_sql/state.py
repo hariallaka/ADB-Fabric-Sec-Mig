@@ -1,0 +1,165 @@
+"""Deployed-state manifest and the revoke script derived from it.
+
+Every ``generate-fabric-sql`` run writes ``deployed_state.json``: the
+views, roles, role members and grants its deploy scripts create, per
+catalog. Pass the manifest from the last *successfully deployed* run as
+``--previous-state``, and the run also writes ``<catalog>__revoke.sql``
+for everything in the previous state that is no longer wanted:
+
+1. ``REVOKE SELECT`` on views no longer granted to a role
+2. ``ALTER ROLE ... DROP MEMBER`` for members no longer mapped
+3. with ``--drop-removed-objects``: ``DROP VIEW`` for views no longer
+   deployed (dependents first) and ``DROP ROLE`` for roles no longer used
+
+The diff only covers objects this toolkit created (they are in the
+manifest). A grant, member, view or role someone added by hand is never in
+the manifest, so it is never revoked or dropped. The flip side: drift made
+by hand is not detected either.
+
+Steps 1 and 2 remove access and always run. Step 3 is opt-in cleanup.
+Revoking grants is enough to cut access; dropping is not needed for
+security.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+
+from dbx_fabric_security.fabric_sql.admin_views import AdminView
+from dbx_fabric_security.fabric_sql.grants import RolePlan
+from dbx_fabric_security.fabric_sql.views import FabricViewScript, quote_ident, quote_nstring
+
+STATE_VERSION = 1
+_GO = "GO"
+
+
+def build_state(
+    scripts: list[FabricViewScript], admin_views: list[AdminView], plan: RolePlan
+) -> dict:
+    """The state the deploy scripts produce once run. ``views`` is kept in
+    creation order so a later drop can go in reverse (dependents first)."""
+    catalogs: dict[str, dict] = {}
+
+    def cat(name: str) -> dict:
+        return catalogs.setdefault(name, {"views": [], "roles": {}})
+
+    for s in scripts:
+        if s.deployable:
+            cat(s.catalog)["views"].append(s.target_name)
+    for av in admin_views:
+        cat(av.catalog)["views"].append(av.target_name)
+    for role, by_catalog in plan.role_grants.items():
+        for catalog, targets in by_catalog.items():
+            cat(catalog)["roles"][role] = {
+                "members": list(plan.role_members.get(role, [])),
+                "grants": list(targets),
+            }
+    return {
+        "version": STATE_VERSION,
+        "catalogs": {c: catalogs[c] for c in sorted(catalogs)},
+    }
+
+
+def load_state(path: str) -> dict:
+    with open(path, encoding="utf-8") as fh:
+        state = json.load(fh)
+    if not isinstance(state, dict) or state.get("version") != STATE_VERSION or "catalogs" not in state:
+        raise ValueError(
+            f"{path} is not a deployed_state.json from this toolkit (expected version {STATE_VERSION})"
+        )
+    return state
+
+
+@dataclass
+class CatalogDiff:
+    catalog: str
+    revoke_grants: list[tuple[str, str]] = field(default_factory=list)  # (role, view)
+    drop_members: list[tuple[str, str]] = field(default_factory=list)  # (role, member)
+    drop_views: list[str] = field(default_factory=list)  # reverse creation order
+    drop_roles: list[str] = field(default_factory=list)
+
+    @property
+    def empty(self) -> bool:
+        return not (self.revoke_grants or self.drop_members or self.drop_views or self.drop_roles)
+
+    def as_dict(self) -> dict:
+        return {
+            "catalog": self.catalog,
+            "revokeGrants": [{"role": r, "view": v} for r, v in self.revoke_grants],
+            "dropMembers": [{"role": r, "member": m} for r, m in self.drop_members],
+            "dropViews": self.drop_views,
+            "dropRoles": self.drop_roles,
+        }
+
+
+def diff_states(previous: dict, current: dict) -> list[CatalogDiff]:
+    diffs = []
+    prev_cats = previous.get("catalogs", {})
+    curr_cats = current.get("catalogs", {})
+    for catalog in sorted(prev_cats):
+        prev = prev_cats[catalog]
+        curr = curr_cats.get(catalog, {"views": [], "roles": {}})
+        d = CatalogDiff(catalog)
+        curr_roles = curr.get("roles", {})
+        for role, prev_role in sorted(prev.get("roles", {}).items()):
+            curr_role = curr_roles.get(role, {"members": [], "grants": []})
+            d.revoke_grants += [(role, v) for v in prev_role.get("grants", []) if v not in curr_role["grants"]]
+            d.drop_members += [(role, m) for m in prev_role.get("members", []) if m not in curr_role["members"]]
+            if role not in curr_roles:
+                d.drop_roles.append(role)
+        curr_views = set(curr.get("views", []))
+        d.drop_views = [v for v in reversed(prev.get("views", [])) if v not in curr_views]
+        if not d.empty:
+            diffs.append(d)
+    return diffs
+
+
+def _object_id_literal(target: str) -> str:
+    return quote_nstring(target)
+
+
+def render_revoke_script(diff: CatalogDiff, drop_removed_objects: bool) -> str:
+    lines = [
+        "-- Generated by dbx-fabric-security generate-fabric-sql --previous-state.",
+        f"-- Run against: the SQL analytics endpoint of the mirrored item for catalog '{diff.catalog}'.",
+        "-- Removes access this toolkit granted on its previous deployment that is no longer wanted.",
+        "-- Run it BEFORE the matching __deploy.sql. Each statement is guarded and idempotent.",
+        "-- Only objects in the previous deployed_state.json are touched; anything created by hand is left alone.",
+        "",
+        "-- ===== 1. Revoke grants =====",
+    ]
+    for role, view in diff.revoke_grants:
+        lines.append(
+            f"IF OBJECT_ID({_object_id_literal(view)}, 'V') IS NOT NULL\n"
+            f"   AND DATABASE_PRINCIPAL_ID({quote_nstring(role)}) IS NOT NULL\n"
+            f"    REVOKE SELECT ON {view} FROM {quote_ident(role)};\n{_GO}"
+        )
+    lines.append("\n-- ===== 2. Remove role members =====")
+    for role, member in diff.drop_members:
+        lines.append(
+            "IF EXISTS (SELECT 1 FROM sys.database_role_members rm\n"
+            "           JOIN sys.database_principals r ON r.principal_id = rm.role_principal_id\n"
+            "           JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id\n"
+            f"           WHERE r.name = {quote_nstring(role)} AND m.name = {quote_nstring(member)})\n"
+            f"    ALTER ROLE {quote_ident(role)} DROP MEMBER {quote_ident(member)};\n{_GO}"
+        )
+
+    drops = []
+    for view in diff.drop_views:
+        drops.append(f"IF OBJECT_ID({_object_id_literal(view)}, 'V') IS NOT NULL\n    DROP VIEW {view};\n{_GO}")
+    for role in diff.drop_roles:
+        drops.append(
+            f"IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = {quote_nstring(role)} AND type = 'R')\n"
+            f"    DROP ROLE {quote_ident(role)};\n{_GO}"
+        )
+    if drops:
+        if drop_removed_objects:
+            lines.append("\n-- ===== 3. Drop views and roles no longer deployed (dependents first) =====")
+            lines.extend(drops)
+        else:
+            lines.append(
+                "\n-- ===== 3. NOT RUN: views/roles no longer deployed (re-run with --drop-removed-objects) ====="
+            )
+            lines.extend("-- " + line for d in drops for line in d.splitlines())
+    return "\n".join(lines) + "\n"

@@ -45,7 +45,11 @@ from dbx_fabric_security.fabric_sql import (
     build_admin_views,
     build_fabric_sql_outputs,
     build_role_plan,
+    build_state,
+    diff_states,
+    load_state,
     parse_role_mapping_csv,
+    render_revoke_script,
     translate_views,
 )
 from dbx_fabric_security.mapping.role_mapper import build_role_mapping
@@ -309,6 +313,16 @@ def cmd_generate_fabric_sql(args: argparse.Namespace) -> int:
         views, scripts, admin_views, admin_exclusions, plan, args.admin_schema, args.admin_role
     )
 
+    # Validate --previous-state before writing anything, so a bad manifest
+    # can't leave a deploy script on disk without its revoke script.
+    current_state = build_state(scripts, admin_views, plan)
+    diffs = diff_states(load_state(args.previous_state), current_state) if args.previous_state else []
+    for d in diffs:
+        files[f"{d.catalog}__revoke.sql"] = render_revoke_script(d, args.drop_removed_objects)
+    report["revocations"] = (
+        [d.as_dict() for d in diffs] if args.previous_state else "not computed (no --previous-state)"
+    )
+
     out_dir = os.path.join(args.out_dir, "fabric_sql")
     os.makedirs(out_dir, exist_ok=True)
     for name, content in files.items():
@@ -316,6 +330,7 @@ def cmd_generate_fabric_sql(args: argparse.Namespace) -> int:
             fh.write(content)
     _write_json(os.path.join(out_dir, "fabric_sql_report.json"), report)
     _write_csv(os.path.join(out_dir, "fabric_view_grants.csv"), plan.grant_rows)
+    _write_json(os.path.join(out_dir, "deployed_state.json"), current_state)
 
     summary = report["summary"]
     print(f"Fabric SQL endpoint scripts -> {out_dir}/: {summary['deployableViews']}/{summary['views']} "
@@ -336,6 +351,16 @@ def cmd_generate_fabric_sql(args: argparse.Namespace) -> int:
         print(f"  WARNING: {w}")
     if admin_exclusions:
         print(f"  {len(admin_exclusions)} view(s) not folded into admin views (see report 'adminExclusions')")
+    if args.previous_state:
+        n_revoke = sum(len(d.revoke_grants) for d in diffs)
+        n_member = sum(len(d.drop_members) for d in diffs)
+        n_drop = sum(len(d.drop_views) + len(d.drop_roles) for d in diffs)
+        print(f"  Revocations vs --previous-state: {n_revoke} grant(s), {n_member} role member(s)"
+              + (f", {n_drop} view/role drop(s)" + ("" if args.drop_removed_objects else " (commented out; pass --drop-removed-objects)") if n_drop else "")
+              + ". Run each __revoke.sql BEFORE its __deploy.sql.")
+    else:
+        print("  No --previous-state: revocations not computed. After this deploy succeeds, keep "
+              "deployed_state.json for the next run.")
 
     problems = summary["needsReviewViews"] + summary["unmappedGrantees"] + summary["overgrantWarnings"]
     if args.strict and problems:
@@ -421,6 +446,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sql.add_argument("--role-mapping", required=True, help="CSV with columns ad_group,fabric_role[,fabric_principal] mapping each Databricks grantee to a Fabric database role")
     p_sql.add_argument("--admin-role", default="super_business_admin", help="Fabric role that gets the combined admin views (members come from --role-mapping rows with this fabric_role)")
     p_sql.add_argument("--admin-schema", default="sec_admin", help="Schema to create the admin views in")
+    p_sql.add_argument("--previous-state", help="deployed_state.json from the last successfully deployed run; produces <catalog>__revoke.sql for grants/members/views no longer wanted")
+    p_sql.add_argument("--drop-removed-objects", action="store_true", help="With --previous-state: also DROP views and roles no longer deployed (default: those statements are written commented out)")
     p_sql.add_argument("--strict", action="store_true", help="Exit non-zero if any view needs review, any grantee is unmapped, or a role merges groups with different access")
     p_sql.set_defaults(func=cmd_generate_fabric_sql)
 
@@ -437,6 +464,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "drop_removed_objects", False) and not getattr(args, "previous_state", None):
+        parser.error("--drop-removed-objects requires --previous-state")
     return args.func(args) or 0
 
 
