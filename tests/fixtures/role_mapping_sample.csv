@@ -1,0 +1,9 @@
+ad_group,fabric_role,fabric_principal
+finance_readers,fabric_finance_reader,
+hr_readers,fabric_hr_reader,
+sales_region_us,fabric_sales_regional,
+sales_region_eu,fabric_sales_regional,
+sales_finance,fabric_sales_finance,
+export_team,fabric_hr_export,
+sales_admin,fabric_sales_admin,
+business_admins,super_business_admin,sg-business-admins

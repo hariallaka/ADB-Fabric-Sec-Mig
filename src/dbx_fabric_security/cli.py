@@ -19,6 +19,10 @@ Subcommands:
     translate              Extract + translate -> CLS/RLS entitlement + Fabric role JSON.
     map-roles               Extract + translate -> AD Group/Fabric Role mapping report.
     deploy                 Translate + a target map -> apply (or dry-run) Fabric roles.
+    generate-fabric-sql    Alternative to translate/deploy: T-SQL views over the Unity Catalog
+                            mirrored item's SQL analytics endpoint, a combined super-admin view
+                            per base table, and AD group -> Fabric role SELECT grants on views
+                            (see docs/fabric-sql-endpoint-views.md).
     run-all                 Runs extract -> translate -> map-roles -> deploy(dry-run) and
                             writes every artifact to --out-dir (local-file source only).
 """
@@ -37,6 +41,13 @@ from dbx_fabric_security.extractor.grants import parse_grants_csv
 from dbx_fabric_security.extractor.view_parser import distinct_base_tables, parse_views_file
 from dbx_fabric_security.fabric_api.client import FabricApiClient
 from dbx_fabric_security.fabric_api.deploy import deploy_roles, resolve_table_target
+from dbx_fabric_security.fabric_sql import (
+    build_admin_views,
+    build_fabric_sql_outputs,
+    build_role_plan,
+    parse_role_mapping_csv,
+    translate_views,
+)
 from dbx_fabric_security.mapping.role_mapper import build_role_mapping
 from dbx_fabric_security.translator.cls_translator import translate_cls
 from dbx_fabric_security.translator.rls_translator import translate_rls
@@ -286,6 +297,53 @@ def cmd_deploy(args: argparse.Namespace) -> None:
               f"in --targets): {skipped_unmapped}")
 
 
+def cmd_generate_fabric_sql(args: argparse.Namespace) -> int:
+    views, _ = _run_extraction(args.views, args.grants, args.table_columns)
+    table_columns = _load_table_columns(args.table_columns)
+    mappings = parse_role_mapping_csv(args.role_mapping)
+
+    scripts = translate_views(views, table_columns)
+    admin_views, admin_exclusions = build_admin_views(views, scripts, args.admin_schema, table_columns)
+    plan = build_role_plan(scripts, mappings, admin_views, args.admin_role)
+    files, report = build_fabric_sql_outputs(
+        views, scripts, admin_views, admin_exclusions, plan, args.admin_schema, args.admin_role
+    )
+
+    out_dir = os.path.join(args.out_dir, "fabric_sql")
+    os.makedirs(out_dir, exist_ok=True)
+    for name, content in files.items():
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as fh:
+            fh.write(content)
+    _write_json(os.path.join(out_dir, "fabric_sql_report.json"), report)
+    _write_csv(os.path.join(out_dir, "fabric_view_grants.csv"), plan.grant_rows)
+
+    summary = report["summary"]
+    print(f"Fabric SQL endpoint scripts -> {out_dir}/: {summary['deployableViews']}/{summary['views']} "
+          f"view(s) deployable, {summary['adminViews']} admin view(s), {summary['roles']} role(s)")
+    for name in sorted(files):
+        print(f"  {name}")
+    if summary["needsReviewViews"]:
+        blocked = [s.source_view for s in scripts if not s.deployable]
+        print(f"  {len(blocked)} view(s) need manual review; no access granted on them: {blocked}")
+    if plan.unmapped_grantees:
+        groups = sorted({u['adGroup'] for u in plan.unmapped_grantees})
+        print(f"  WARNING: {len(groups)} Databricks grantee(s) have no row in --role-mapping, "
+              f"so they get nothing: {groups}")
+    for w in plan.overgrant_warnings:
+        print(f"  WARNING: role '{w['fabricRole']}' merges groups with different view access: "
+              f"{w['viewsByGroup']}")
+    for w in plan.warnings:
+        print(f"  WARNING: {w}")
+    if admin_exclusions:
+        print(f"  {len(admin_exclusions)} view(s) not folded into admin views (see report 'adminExclusions')")
+
+    problems = summary["needsReviewViews"] + summary["unmappedGrantees"] + summary["overgrantWarnings"]
+    if args.strict and problems:
+        print("STRICT: failing because of the issues above.")
+        return 1
+    return 0
+
+
 def cmd_run_all(args: argparse.Namespace) -> None:
     print("== Step 1/4: extract ==")
     cmd_extract(args)
@@ -355,6 +413,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_deploy.add_argument("--apply", action="store_true", help="Actually call the Fabric API (default: dry-run)")
     p_deploy.set_defaults(func=cmd_deploy)
 
+    p_sql = sub.add_parser(
+        "generate-fabric-sql",
+        help="Generate T-SQL views + super-admin views + role grants for the mirrored item's SQL analytics endpoint",
+    )
+    common(p_sql)
+    p_sql.add_argument("--role-mapping", required=True, help="CSV with columns ad_group,fabric_role[,fabric_principal] mapping each Databricks grantee to a Fabric database role")
+    p_sql.add_argument("--admin-role", default="super_business_admin", help="Fabric role that gets the combined admin views (members come from --role-mapping rows with this fabric_role)")
+    p_sql.add_argument("--admin-schema", default="sec_admin", help="Schema to create the admin views in")
+    p_sql.add_argument("--strict", action="store_true", help="Exit non-zero if any view needs review, any grantee is unmapped, or a role merges groups with different access")
+    p_sql.set_defaults(func=cmd_generate_fabric_sql)
+
     p_all = sub.add_parser("run-all", help="Run the full extract -> translate -> map-roles -> deploy pipeline")
     common(p_all)
     p_all.add_argument("--targets")
@@ -368,8 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
-    return 0
+    return args.func(args) or 0
 
 
 if __name__ == "__main__":

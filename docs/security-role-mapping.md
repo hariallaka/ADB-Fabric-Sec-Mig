@@ -55,6 +55,15 @@ unioned) — so Fabric role count stays proportional to the number of
 distinct table/principal access patterns rather than to the number of
 Databricks views.
 
+> **Over-exposure risk.** The merge is only exact when the merged views
+> share the same row filter or the same column list. Take two views on one
+> table with *different* columns and *different* filters (`v1: c1..c3 WHERE
+> c1 > 2`, `v2: c4..c6 WHERE c2 < 4`). The merged role grants `c1..c6` on
+> rows matching either filter, so `c4..c6` show up on rows where only
+> `c1 > 2` holds. Table-level RLS + CLS can't express this case. Use the
+> per-view T-SQL path in
+> [fabric-sql-endpoint-views.md](./fabric-sql-endpoint-views.md) instead.
+
 ## Relationship between Fabric roles and OneLake objects
 
 A role's `decisionRules[].permission[].attributeValueIncludedIn` scopes it

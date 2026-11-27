@@ -69,7 +69,8 @@ the same way as `AND` — verbatim, by construction, not as a special case
 | Interactive notebook extraction (logged-in-user identity) | [`notebooks/`](notebooks/) |
 | Azure DevOps pipeline — Databricks-side extraction | [`pipelines/azure-pipelines-databricks-extract.yml`](pipelines/azure-pipelines-databricks-extract.yml) |
 | Azure DevOps pipeline — Fabric-side translate/deploy | [`pipelines/azure-pipelines-security-migration.yml`](pipelines/azure-pipelines-security-migration.yml) |
-| Automated tests (52 passing) | [`tests/`](tests/) |
+| Fabric SQL endpoint path (per-view T-SQL views + super-admin views + role grants) | [`docs/fabric-sql-endpoint-views.md`](docs/fabric-sql-endpoint-views.md) |
+| Automated tests (78 passing) | [`tests/`](tests/) |
 
 ## How it works
 
@@ -121,7 +122,8 @@ pytest tests/ -v
 ```
 
 Individual stages are also available: `extract`, `extract-databricks`,
-`grant-catalog-access`, `translate`, `map-roles`, `deploy` (see
+`grant-catalog-access`, `translate`, `map-roles`, `deploy`,
+`generate-fabric-sql` (see
 `python -m dbx_fabric_security.cli --help`). `extract-databricks`,
 `grant-catalog-access`, and `deploy` all default to a network-free dry run;
 they only call a live API when given `--execute`/`--execute`/`--apply`
@@ -224,6 +226,29 @@ DevOps, this is
 which consumes step 1's pipeline artifact via a `resources.pipelines`
 reference (or locally-supplied files, for dev/test — see the
 `extractSource` parameter in that YAML).
+
+**2b. Alternative Fabric side: T-SQL views on the mirrored item's SQL
+analytics endpoint.** When several views on one table have different column
+lists *and* different row filters, the OneLake role path above can't
+represent them without over-exposing data, because it merges them into one
+table-level role per principal. `generate-fabric-sql` keeps each view as a
+T-SQL view, grants `SELECT` per view to Fabric roles from an AD group →
+Fabric role CSV, and builds one combined super-admin view per base table
+(union of columns, `OR` of row filters):
+
+```bash
+python -m dbx_fabric_security.cli generate-fabric-sql \
+  --views out/databricks-extract/extracted_views.sql \
+  --grants out/databricks-extract/extracted_grants.csv \
+  --table-columns out/databricks-extract/extracted_table_columns.json \
+  --role-mapping path/to/ad_group_to_fabric_role.csv \
+  --out-dir out/fabric-sql
+```
+
+Read [`docs/fabric-sql-endpoint-views.md`](docs/fabric-sql-endpoint-views.md)
+before deploying. It lists which views are held back for review, and the
+in-tenant checks (ownership chaining, item sharing at Read only) that the
+design's security depends on.
 
 **Target end state:** one Azure DevOps pipeline (or one identity running
 both pipelines above back-to-back) using a single Azure AD
